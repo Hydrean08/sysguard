@@ -1,0 +1,79 @@
+# sysguard config — copy to config.yaml and edit, then `systemctl --user restart sysguard`.
+# Ships in dry-run: NOTHING is killed/restarted/capped until you flip dry_run to false.
+
+# --- runtime ---
+sample_interval_seconds: 30
+history_window_samples: 60          # 60 * 30s = 30 min rolling window (live detection)
+dry_run: true                        # audit-only. Watch decisions.jsonl for a week, then set false.
+
+# --- history (durable time-series sink) ---
+# Live detection uses the in-memory window above. This SEPARATELY persists every
+# per-unit RSS sample + system stats to SQLite at ~/.local/share/sysguard/history.db
+# so long-term trends survive restarts and can be graphed / post-mortemed.
+# Passive recorder — never in the kill/restart path.
+history_db_enabled: true
+history_retention_days: 30
+history_prune_interval_seconds: 3600
+
+# --- ollama (local LLM triage) ---
+ollama_url: http://localhost:11434
+primary_model: phi4-mini:3.8b        # fast triage every cycle
+escalation_model: glm4:9b            # for "investigate" labels
+fallback_model: qwen3:1.7b           # used when system memory is critical
+ollama_timeout_seconds: 60           # cold model load can take 30-45s
+ollama_num_threads: 4                # CPU threads per inference call
+
+# --- detection thresholds (flag a unit for triage if ANY are true) ---
+rss_absolute_mb: 4096                # over 4GB resident (new units without a baseline yet)
+rss_growth_mb_per_min: 50            # growing faster than 50MB/min over the recent window
+rss_jump_mb: 500                     # jumped >500MB in a single sample
+rss_jump_min_samples: 5              # ignore jump threshold until N samples collected
+system_available_mb_floor: 2048      # below 2GB free -> triage everything > 1GB
+system_critical_available_mb: 1024   # below 1GB -> crisis mode (use fallback model)
+escalation_min_available_mb: 8192    # skip escalation model if less free than this
+
+# --- adaptive baseline ---
+baseline_multiplier: 2.0             # flag when RSS exceeds N x the learned baseline (0 = disable)
+baseline_min_samples: 20             # samples before adaptive mode activates (~10 min)
+
+# --- intervention rules ---
+max_actions_per_unit_per_hour: 1     # prevents flap loops
+require_confirm_for_kill: true
+allowed_actions: [restart, cap]      # 'kill' deliberately omitted
+default_cap_mb: 0                    # 0 = compute as 1.5x baseline RSS; or set absolute MB
+
+# --- skip list ---
+# Hardcoded skips (your shell, sshd, the desktop session, ollama, etc.) are always
+# merged in by the code. Add your own here. Names match a systemd unit OR process comm.
+extra_skip_units:
+  # - docker:my-database     # example: a container you already cap via its own limits
+extra_skip_processes: []
+
+# --- per-unit action overrides ---
+# Force a specific action for units where you already know the right fix.
+# Key matches the friendly name (substring); value is the forced action.
+unit_action_overrides:
+  # - my-fuse-daemon: restart   # example: a cache-growing daemon a restart cleanly reclaims
+
+# --- per-unit RSS floors ---
+# Ignore a unit entirely below this RSS (overrides the global floor). Useful for units
+# whose working set legitimately swings high (read-ahead buffers, JIT heaps).
+unit_rss_floor_mb:
+  # - my-fuse-daemon: 2500
+
+# --- disk monitoring (alerts at most once per 15 min per mount) ---
+disk_root_warn_mb: 20480
+disk_root_crit_mb: 10240
+disk_pool_warn_mb: 30720
+
+# --- phone notifications (ntfy) ---
+# Install the ntfy app, subscribe to your topic, done. Pick something unguessable.
+ntfy_url: https://ntfy.sh
+ntfy_topic: ""                       # set to a private, random string to enable, e.g. "sysguard-x7k2m9"
+ntfy_token: ""                       # only for access-controlled topics
+ntfy_min_priority: 1                 # send notifications >= this (1=all ... 5=crit only)
+
+# --- notifications ---
+kde_notify: true
+notify_on_dry_run: false
+log_level: INFO

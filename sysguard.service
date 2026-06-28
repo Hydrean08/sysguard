@@ -1,0 +1,30 @@
+[Unit]
+Description=sysguard — predictive memory health monitor with AI triage
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/sysguard/sysguard.py
+Restart=on-failure
+RestartSec=30s
+
+# Cap user units to avoid respawn storms (one OOM must not become a respawn loop)
+MemoryMax=512M
+MemoryHigh=384M
+
+# Don't let sysguard contribute to system pressure if it goes sideways
+CPUQuota=20%
+Nice=10
+
+# Start-limit window — if sysguard itself crashes repeatedly, stop trying
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Logs go to journalctl --user -u sysguard
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sysguard
+
+[Install]
+WantedBy=default.target

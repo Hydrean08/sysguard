@@ -1,0 +1,14 @@
+# Real config holds your ntfy topic + host-specific tuning — never commit it.
+config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local runtime state (history DB, decisions log, etc.)
+*.db
+*.db-shm
+*.db-wal
+state.json
