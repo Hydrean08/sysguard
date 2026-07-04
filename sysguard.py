@@ -27,6 +27,8 @@ from urllib.request import Request, urlopen
 import psutil
 import yaml
 
+import ai_diagnose
+
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.yaml"
 STATE_DIR = Path.home() / ".local/share/sysguard"
@@ -60,6 +62,11 @@ HARDCODED_SKIPS = {
     "ollama",
     # sysguard itself
     "sysguard",
+    # Prism — the Electron app that hosts the Claude Code session. Restarting it
+    # kills the running session; a MemoryHigh cap can OOM the Electron renderer.
+    # Its RSS is bursty (has flagged at 3.3× baseline), so without this it was one
+    # model "restart"/"cap" verdict away from taking the session down in live mode.
+    "prism",
 }
 
 # Substrings that match systemd unit names to skip
@@ -70,6 +77,10 @@ HARDCODED_SKIP_UNITS = {
     "docker.service", "containerd.service",
     "ollama.service",
     "sysguard.service",
+    # Transient systemd-run jobs (run-rNNNN / run-pNNNN / run-uNNNN .service/.scope)
+    # are ephemeral — gone by the next cycle. Tracking them produces churn and one
+    # wasted a full Claude escalation timeout on a scope that had already vanished.
+    "run-r", "run-p", "run-u",
 }
 
 
@@ -89,7 +100,10 @@ class UnitHistory:
 
     def add(self, rss_mb: float, ts: float):
         self.samples.append(UnitSample(ts, rss_mb))
-        # baseline = min of first 10 samples
+        # Startup-min seed: a provisional baseline for brand-new units with no
+        # history yet. In median mode refresh_baselines() overwrites this with the
+        # rolling median once enough samples exist in history.db (the `if not`
+        # guard means we only seed once, then defer to the adaptive refresh).
         if not self.baseline_rss_mb and len(self.samples) >= 10:
             self.baseline_rss_mb = min(s.rss_mb for s in list(self.samples)[:10])
 
@@ -183,6 +197,35 @@ class HistoryDB:
                 )
         except sqlite3.Error as e:
             logging.warning("history: write failed: %s", e)
+
+    def unit_medians(self, window_hours: float, min_samples: int) -> dict[str, float]:
+        """Median RSS per unit over the trailing window — the adaptive baseline.
+
+        Read-only (stays a passive recorder). Median, not mean, so transient
+        spikes don't skew it. Units with fewer than min_samples in the window
+        are omitted so a barely-seen unit keeps its startup-min fallback.
+        """
+        cutoff = int(time.time()) - int(window_hours * 3600)
+        out: dict[str, float] = {}
+        try:
+            rows = self.conn.execute(
+                "SELECT unit, COUNT(*) FROM unit_samples WHERE ts > ? "
+                "GROUP BY unit HAVING COUNT(*) >= ?",
+                (cutoff, min_samples),
+            ).fetchall()
+            for unit, cnt in rows:
+                # True median via the middle ordered row (lower-middle for even
+                # counts — close enough; avoids averaging two queries).
+                row = self.conn.execute(
+                    "SELECT rss_mb FROM unit_samples WHERE unit = ? AND ts > ? "
+                    "ORDER BY rss_mb LIMIT 1 OFFSET ?",
+                    (unit, cutoff, (cnt - 1) // 2),
+                ).fetchone()
+                if row:
+                    out[unit] = row[0]
+        except sqlite3.Error as e:
+            logging.warning("baseline: median query failed: %s", e)
+        return out
 
     def prune(self, retention_days: int):
         cutoff = int(time.time()) - retention_days * 86400
@@ -404,7 +447,7 @@ Current RSS: {rss_now:.0f} MB
 RSS ~5 min ago: {rss_5min_ago:.0f} MB
 Growth slope: {hist.slope_mb_per_min():.1f} MB/min (last 5 min)
 Last-sample jump: {hist.jump_mb():+.0f} MB
-Baseline (early-window min): {hist.baseline_rss_mb:.0f} MB
+Baseline (adaptive median, normal size for this unit): {hist.baseline_rss_mb:.0f} MB
 Samples held: {len(samples)}
 
 System: available={sysm.available_mb:.0f}MB, swap_used={sysm.swap_used_mb:.0f}/{sysm.swap_total_mb:.0f}MB
@@ -514,6 +557,89 @@ def check_disk(sysm: SystemSample, cfg: dict, now: float):
         _alert("pool_warn", "warn", "sysguard: docker-pool low",
                f"docker-pool {sysm.disk_pool_free_mb / 1024:.1f} GB free",
                priority=3)
+
+
+_swap_alert_last: dict[str, float] = {}
+_SWAP_ALERT_COOLDOWN = 900  # 15 min between repeated swap alerts
+
+
+def check_swap(sysm: SystemSample, cfg: dict, now: float):
+    """Alert on swap saturation — the blind spot in the available_mb-only checks.
+
+    available_mb counts reclaimable page cache, so the box can sit at 99% swap
+    (one spike from OOM) while every other signal reads healthy. This surfaces it.
+    Alert-only, like check_disk — never actuates.
+    """
+    total = sysm.swap_total_mb
+    if total <= 0:
+        return
+    pct = 100.0 * sysm.swap_used_mb / total
+    warn = cfg.get("swap_used_pct_warn", 85)
+    crit = cfg.get("swap_used_pct_crit", 95)
+
+    def _alert(key: str, level: str, title: str, msg: str, priority: int):
+        if now - _swap_alert_last.get(key, 0) < _SWAP_ALERT_COOLDOWN:
+            return
+        _swap_alert_last[key] = now
+        (logging.error if level == "crit" else logging.warning)("%s", msg)
+        if cfg["kde_notify"]:
+            notify_kde(title, msg)
+        notify_ntfy(cfg, title, msg, priority)
+
+    used_gb, total_gb = sysm.swap_used_mb / 1024, total / 1024
+    if pct >= crit:
+        _alert("swap_crit", "crit", "sysguard: SWAP CRITICAL",
+               f"swap {pct:.0f}% full ({used_gb:.1f}/{total_gb:.1f}GB) — OOM risk "
+               f"(available RAM masks this)", priority=5)
+    elif pct >= warn:
+        _alert("swap_warn", "warn", "sysguard: swap high",
+               f"swap {pct:.0f}% full ({used_gb:.1f}/{total_gb:.1f}GB)", priority=4)
+
+
+_headroom_hist: deque = deque(maxlen=20)  # (ts, headroom_mb) — memory + free swap
+_oom_forecast_last: float = 0.0
+_OOM_FORECAST_COOLDOWN = 600  # 10 min between forecast alerts
+
+
+def check_oom_forecast(sysm: SystemSample, cfg: dict, now: float):
+    """Predictive early-warning: least-squares fit the memory+swap headroom trend
+    and, if it's shrinking, extrapolate to exhaustion. Alert when the ETA drops
+    under oom_forecast_warn_min. This is the "predict before it dies" piece — it
+    fires with lead time, unlike the reactive slope/jump flags. Alert-only."""
+    global _oom_forecast_last
+    swap_free = max(0.0, sysm.swap_total_mb - sysm.swap_used_mb)
+    headroom = sysm.available_mb + swap_free
+    _headroom_hist.append((now, headroom))
+    if len(_headroom_hist) < 5:
+        return
+
+    t0 = _headroom_hist[0][0]
+    xs = [(t - t0) / 60.0 for t, _ in _headroom_hist]  # minutes
+    ys = [h for _, h in _headroom_hist]
+    n = len(xs)
+    sx, sy = sum(xs), sum(ys)
+    sxx = sum(x * x for x in xs)
+    sxy = sum(x * y for x, y in zip(xs, ys))
+    denom = n * sxx - sx * sx
+    if denom == 0:
+        return
+    slope = (n * sxy - sx * sy) / denom  # MB/min; negative = shrinking
+    if slope >= -1.0:  # flat or growing — no OOM on the horizon
+        return
+    eta_min = ys[-1] / (-slope)
+    warn = cfg.get("oom_forecast_warn_min", 30)
+    if eta_min > warn:
+        return
+    if now - _oom_forecast_last < _OOM_FORECAST_COOLDOWN:
+        return
+    _oom_forecast_last = now
+    priority = 5 if eta_min < 10 else 4
+    msg = (f"memory+swap headroom {ys[-1] / 1024:.1f}GB falling {-slope:.0f}MB/min "
+           f"→ OOM in ~{eta_min:.0f} min at this rate")
+    logging.error("OOM FORECAST: %s", msg)
+    if cfg["kde_notify"]:
+        notify_kde("sysguard: OOM predicted", msg)
+    notify_ntfy(cfg, "sysguard: OOM predicted", msg, priority=priority)
 
 
 def gather_extra_context(friendly: str, kind: str) -> str:
@@ -661,7 +787,10 @@ def execute_action(unit_id: str, friendly: str, kind: str, action: str,
     if action not in cfg["allowed_actions"]:
         return False, f"action {action} not in allowed_actions"
 
-    cap_mb = _planned_cap_mb(hist, cfg)
+    # cap_mb is only used by the cap action; guard so a caller without a live
+    # UnitHistory (e.g. the AI approve→execute path passing hist=None for a
+    # restart) doesn't crash computing a size it never uses.
+    cap_mb = _planned_cap_mb(hist, cfg) if hist is not None else 0
 
     if kind == "docker":
         container = friendly.split(":", 1)[1] if friendly.startswith("docker:") else friendly
@@ -780,11 +909,14 @@ def should_flag(hist: UnitHistory, sysm: SystemSample, cfg: dict) -> Optional[st
     # FUSE daemon whose read-ahead buffers swing up to ~1.5GB) are ignored below
     # their own floor, so normal buffer churn doesn't trip the global jump/slope
     # thresholds. Anything not listed uses the 200MB default.
+    # Most-specific (longest) matching pattern wins, so "orionfs" (4500) beats
+    # "orion" (2000) for the orionfs unit regardless of config key order — the
+    # old first-match-and-break was silently order-dependent.
     floor = 200
+    best_pat = ""
     for pat, mb in (cfg.get("unit_rss_floor_mb") or {}).items():
-        if pat in hist.name:
-            floor = mb
-            break
+        if pat in hist.name and len(pat) > len(best_pat):
+            best_pat, floor = pat, mb
     if cur < floor:
         return None
     slope = hist.slope_mb_per_min()
@@ -820,6 +952,20 @@ def should_flag(hist: UnitHistory, sysm: SystemSample, cfg: dict) -> Optional[st
 
     if sysm.available_mb < cfg["system_available_mb_floor"] and cur >= 1024:
         return f"system low ({sysm.available_mb:.0f}MB free) and unit holds {cur:.0f}MB"
+
+    # Swap saturation: available_mb can read healthy (reclaimable cache) while
+    # swap is nearly full and the box is one spike from OOM. Triage the largest
+    # holders — but ONLY when saturation coincides with real memory stalls
+    # (PSI full > 0). Swap can sit high-but-stable (no thrashing) for legit
+    # reasons; acting then would be an action storm. check_swap() still alerts
+    # on saturation alone so the user is warned before it tips into thrashing.
+    swap_floor = cfg.get("system_swap_pct_floor", 90)
+    psi_min = cfg.get("system_swap_psi_full_min", 5.0)
+    if sysm.swap_total_mb > 0 and cur >= 1024:
+        swap_pct = 100.0 * sysm.swap_used_mb / sysm.swap_total_mb
+        if swap_pct >= swap_floor and sysm.pressure_full_avg10 >= psi_min:
+            return (f"swap {swap_pct:.0f}% full with memory stalls "
+                    f"(PSI full={sysm.pressure_full_avg10:.0f}), unit holds {cur:.0f}MB")
     return None
 
 
@@ -827,6 +973,102 @@ def can_act_on(hist: UnitHistory, cfg: dict, now: float) -> bool:
     if now - hist.last_action_at < 3600 / cfg["max_actions_per_unit_per_hour"]:
         return False
     return True
+
+
+def has_memory_cap(unit_id: str, friendly: str, kind: str) -> bool:
+    """True if the OS already bounds this unit's memory (systemd MemoryMax/High or
+    a docker --memory limit). Such units OOM-recycle on their own, so sysguard
+    acting on them is redundant and was the source of most false-positive caps
+    (chatterbox, crafty, jellyfin…). Fails safe to False (unknown → don't treat as
+    capped; the confidence/grace gates still apply)."""
+    try:
+        if kind == "docker":
+            container = friendly.split(":", 1)[1] if friendly.startswith("docker:") else friendly
+            # Absolute path: the systemd user unit doesn't propagate /usr/bin in
+            # PATH, so relative `docker` fails to spawn (as noted at collectHomelab).
+            r = subprocess.run(
+                ["/usr/bin/docker", "inspect", "-f", "{{.HostConfig.Memory}}", container],
+                capture_output=True, text=True, timeout=5,
+            )
+            return r.returncode == 0 and r.stdout.strip().isdigit() and int(r.stdout.strip()) > 0
+        scope_flag = _systemctl_scope_flag(kind)
+        r = subprocess.run(
+            ["systemctl", scope_flag, "show", unit_id, "-p", "MemoryMax", "-p", "MemoryHigh", "--value"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in r.stdout.split("\n"):
+            v = line.strip()
+            if v and v != "infinity" and v.isdigit() and int(v) < 10**15:
+                return True
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+        pass
+    return False
+
+
+def count_signals(hist: UnitHistory, sysm: SystemSample, cfg: dict) -> tuple[int, float]:
+    """Return (number of independent thresholds tripped, peak severity ratio).
+
+    Used by the action gate to distinguish an obvious runaway (many signals, or one
+    signal far over its threshold) from a lone marginal reading. MUST mirror the
+    thresholds in should_flag() — kept parallel rather than merged to leave the
+    battle-tested should_flag() untouched.
+    """
+    cur = hist.current_mb()
+    slope = hist.slope_mb_per_min()
+    jump = hist.jump_mb()
+    ratios: list[float] = []
+
+    g = cfg["rss_growth_mb_per_min"]
+    if slope >= g and g > 0:
+        ratios.append(slope / g)
+    j = cfg["rss_jump_mb"]
+    if jump >= j and j > 0 and len(hist.samples) >= cfg.get("rss_jump_min_samples", 5):
+        ratios.append(jump / j)
+
+    baseline_mult = cfg.get("baseline_multiplier", 2.0)
+    baseline_ready = (baseline_mult > 0 and hist.baseline_rss_mb > 0
+                      and len(hist.samples) >= cfg.get("baseline_min_samples", 20))
+    if baseline_ready:
+        threshold = hist.baseline_rss_mb * baseline_mult
+        if cur >= threshold and slope > 5:
+            ratios.append(cur / threshold)
+    else:
+        if cur >= cfg["rss_absolute_mb"] and (slope > 5 or sysm.available_mb < cfg["system_available_mb_floor"]):
+            ratios.append(cur / cfg["rss_absolute_mb"])
+
+    if sysm.available_mb < cfg["system_available_mb_floor"] and cur >= 1024:
+        ratios.append(cfg["system_available_mb_floor"] / max(1.0, sysm.available_mb))
+
+    return len(ratios), (max(ratios) if ratios else 0.0)
+
+
+def gate_action(unit_id: str, friendly: str, kind: str, hist: UnitHistory,
+                sysm: SystemSample, cfg: dict, has_override: bool) -> Optional[str]:
+    """Decide whether a destructive restart/cap should EXECUTE. Returns None to
+    proceed, or a short reason string to HOLD (alert-only). Explicit
+    unit_action_overrides bypass every gate (the user asked for that action).
+
+    The gates, in order: (1) the OS already caps this unit; (2) it's too new to
+    judge and the system isn't critical (protects freshly-added programs); (3) the
+    evidence is a single marginal signal (not an obvious runaway) and the system
+    isn't critical.
+    """
+    if has_override:
+        return None
+    critical = sysm.available_mb < cfg["system_critical_available_mb"]
+
+    if cfg.get("skip_os_capped_units", True) and has_memory_cap(unit_id, friendly, kind):
+        return "OS already memory-limits this unit (systemd/docker owns its OOM)"
+
+    grace = cfg.get("action_grace_samples", 20)
+    if len(hist.samples) < grace and not critical:
+        return f"unit too new ({len(hist.samples)}/{grace} samples) — grace period, system not critical"
+
+    nsig, peak = count_signals(hist, sysm, cfg)
+    strong = peak >= cfg.get("strong_signal_ratio", 2.0)
+    if not (critical or strong or nsig >= cfg.get("min_signals_to_act", 2)):
+        return f"low confidence ({nsig} signal(s), peak {peak:.1f}×) — alert only"
+    return None
 
 
 def cycle(cfg: dict, units: dict[str, UnitHistory],
@@ -841,7 +1083,21 @@ def cycle(cfg: dict, units: dict[str, UnitHistory],
     logging.info("disk: root=%.0fGB free, pool=%.0fGB free",
                  sysm.disk_root_free_mb / 1024, sysm.disk_pool_free_mb / 1024)
     check_disk(sysm, cfg, now)
+    check_swap(sysm, cfg, now)
+    check_oom_forecast(sysm, cfg, now)
+    # Merge the AI's self-tuned floors on top of the config.yaml floors (config
+    # wins ties only if larger — a human floor is never lowered by auto-tuning).
+    auto_floors = ai_diagnose.load_auto_floors()
+    if auto_floors:
+        merged = dict(cfg.get("unit_rss_floor_mb") or {})
+        for unit, mb in auto_floors.items():
+            merged[unit] = max(merged.get(unit, 0), mb)
+        cfg["unit_rss_floor_mb"] = merged
     run_verifications(units, cfg, now)
+    # Execute any AI proposals the phone approved (via sysguard's own action
+    # machinery — never arbitrary shell). Cheap no-op when none are approved.
+    if cfg.get("ai_diagnose_enabled", False):
+        ai_diagnose.execute_approved(cfg, execute_action, lift_cap, notify_ntfy)
 
     extra_units = cfg.get("extra_skip_units") or []
     extra_procs = cfg.get("extra_skip_processes") or []
@@ -875,8 +1131,8 @@ def cycle(cfg: dict, units: dict[str, UnitHistory],
 
         model = pick_model(cfg, sysm)
         extra_ctx = gather_extra_context(friendly, kind)
-        prompt = build_prompt(friendly, kind, hist, sysm,
-                              journal_tail(unit_id, friendly, kind), extra_ctx)
+        jtail = journal_tail(unit_id, friendly, kind)
+        prompt = build_prompt(friendly, kind, hist, sysm, jtail, extra_ctx)
         result = call_ollama(cfg["ollama_url"], model, prompt, cfg["ollama_timeout_seconds"],
                              cfg.get("ollama_num_threads", 4))
         if not result:
@@ -910,12 +1166,20 @@ def cycle(cfg: dict, units: dict[str, UnitHistory],
         # units with a forced override don't stall indefinitely waiting for a larger model.
         overridden_from = None
         if action in ("restart", "cap", "investigate"):
+            # Most-specific (longest) matching override key wins — order-independent.
+            best_key = ""
+            best_forced = None
             for key, forced in (cfg.get("unit_action_overrides") or {}).items():
-                if key.lower() in friendly.lower() and forced != action:
-                    overridden_from = action
-                    action = forced
-                    ai_reason = f"[override {overridden_from}->{forced}] {ai_reason}"
-                    break
+                if key.lower() in friendly.lower() and len(key) > len(best_key):
+                    best_key, best_forced = key, forced
+            if best_forced and best_forced != action:
+                overridden_from = action
+                action = best_forced
+                ai_reason = f"[override {overridden_from}->{best_forced}] {ai_reason}"
+        # Explicitly-listed units bypass the safety gate below — the user asked for
+        # that action (e.g. orionfs: restart), even if it's a young or capped unit.
+        has_override = any(k.lower() in friendly.lower()
+                           for k in (cfg.get("unit_action_overrides") or {}))
 
         decision = {
             "ts": now, "unit_id": unit_id, "friendly": friendly, "kind": kind,
@@ -927,6 +1191,24 @@ def cycle(cfg: dict, units: dict[str, UnitHistory],
             "baseline_mb": hist.baseline_rss_mb,
             "dry_run": cfg["dry_run"],
         }
+
+        # Safety gate: a flagged unit is triaged + logged, but a destructive
+        # restart/cap only EXECUTES when it clears the gate (OS-uncapped, past its
+        # grace period, and backed by strong/multi-signal evidence — or the system
+        # is genuinely critical). Held actions are logged (visible on the dashboard)
+        # but do NOT execute or notify — this is what stops sysguard from becoming
+        # the thing that disrupts services on every marginal flag.
+        held = gate_action(unit_id, friendly, kind, hist, sysm, cfg, has_override) \
+            if action in ("restart", "cap") else None
+        if held:
+            decision["held"] = True
+            decision["hold_reason"] = held
+            decision["execution_ok"] = False
+            decision["execution_msg"] = f"HELD: {held}"
+            hist.last_action_at = now  # respect the 1/hr re-eval cadence; don't re-triage every 30s
+            logging.warning("  -> HELD %s on %s: %s", action, friendly, held)
+            log_decision(decision)
+            continue
 
         if action in ("restart", "cap"):
             ok, msg = execute_action(unit_id, friendly, kind, action, cfg, hist)
@@ -956,6 +1238,26 @@ def cycle(cfg: dict, units: dict[str, UnitHistory],
                             f"{action}: {ai_reason}", priority=3)
         else:
             logging.info("  -> %s: %s", action, ai_reason)
+            # Terminal "investigate": the local models (phi4→glm4) are stumped and
+            # there's no known fix. Escalate to headless Claude for a real
+            # root-cause diagnosis (no-tools reasoning over the evidence we already
+            # have). Fire-and-forget; ai_diagnose enforces its own enable switch,
+            # memory floor, per-unit cooldown, and daily cap.
+            if action == "investigate":
+                evidence = (
+                    f"Unit: {friendly} ({kind})\n"
+                    f"RSS now {hist.current_mb():.0f}MB, baseline {hist.baseline_rss_mb:.0f}MB, "
+                    f"slope {hist.slope_mb_per_min():.1f}MB/min, last jump {hist.jump_mb():+.0f}MB, "
+                    f"{len(hist.samples)} samples\n"
+                    f"System: available {sysm.available_mb:.0f}MB, "
+                    f"swap {sysm.swap_used_mb:.0f}/{sysm.swap_total_mb:.0f}MB, "
+                    f"PSI mem some_avg10={sysm.pressure_some_avg10:.1f} full_avg10={sysm.pressure_full_avg10:.1f}\n"
+                    f"Local model said: {ai_reason}\n"
+                    f"Live docker stats: {extra_ctx or '(n/a)'}\n"
+                    f"Recent journal:\n{jtail or '(none)'}"
+                )
+                ai_diagnose.escalate(unit_id, friendly, kind, evidence,
+                                     sysm.available_mb, cfg, notify_ntfy)
 
         log_decision(decision)
 
@@ -970,6 +1272,29 @@ def cycle(cfg: dict, units: dict[str, UnitHistory],
              (not h.samples or now - h.samples[-1].timestamp > 3600)]
     for n in stale:
         del units[n]
+
+
+def refresh_baselines(units: dict, hist_db: Optional[HistoryDB], cfg: dict) -> None:
+    """Update each unit's baseline to its median RSS over the rolling window.
+
+    No-op in startup_min mode or without a history DB (units keep the frozen
+    min-of-first-10 baseline from UnitHistory.add). This is what makes detection
+    ADAPT: the baseline tracks each unit's real steady-state instead of the value
+    it happened to have at startup.
+    """
+    if hist_db is None or cfg.get("baseline_mode", "median") != "median":
+        return
+    window = cfg.get("baseline_window_hours", 72)
+    min_samples = cfg.get("baseline_min_samples", 20)
+    medians = hist_db.unit_medians(window, min_samples)
+    updated = 0
+    for name, h in units.items():
+        m = medians.get(name)
+        if m and m > 0 and abs(m - h.baseline_rss_mb) >= 1.0:
+            h.baseline_rss_mb = m
+            updated += 1
+    if updated:
+        logging.info("baseline: refreshed %d unit medians over %dh window", updated, window)
 
 
 def main():
@@ -1004,6 +1329,10 @@ def main():
             logging.warning("history: disabled, could not open db: %s", e)
             hist_db = None
 
+    # Seed adaptive baselines from history immediately so a restart doesn't fall
+    # back to startup-min values for units that already have a known steady-state.
+    refresh_baselines(units, hist_db, cfg)
+
     stop = False
 
     def _stop(*_):
@@ -1017,7 +1346,9 @@ def main():
     interval = cfg["sample_interval_seconds"]
     last_save = 0.0
     last_prune = 0.0
+    last_baseline = time.time()  # initial seed already done above
     prune_every = cfg.get("history_prune_interval_seconds", 3600)
+    baseline_every = cfg.get("baseline_refresh_interval_seconds", 3600)
     retention_days = cfg.get("history_retention_days", 30)
     while not stop:
         try:
@@ -1031,6 +1362,9 @@ def main():
         if hist_db is not None and now - last_prune > prune_every:
             hist_db.prune(retention_days)
             last_prune = now
+        if hist_db is not None and now - last_baseline > baseline_every:
+            refresh_baselines(units, hist_db, cfg)
+            last_baseline = now
         # sleep but wake on signal
         for _ in range(interval):
             if stop:

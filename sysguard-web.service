@@ -1,0 +1,26 @@
+[Unit]
+Description=sysguard-web — read-only dashboard for sysguard
+After=network-online.target
+Wants=network-online.target
+# Stop trying if it crash-loops (these keys are [Unit]-scoped)
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/sysguard/web.py
+Restart=on-failure
+RestartSec=10s
+
+# Read-only viewer — keep it tiny; it must never become part of the problem.
+MemoryMax=192M
+MemoryHigh=128M
+CPUQuota=15%
+Nice=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sysguard-web
+
+[Install]
+WantedBy=default.target

@@ -15,6 +15,24 @@ history_db_enabled: true
 history_retention_days: 30
 history_prune_interval_seconds: 3600
 
+# --- AI root-cause escalation (headless Claude) ---
+# On a terminal "investigate" (local models stumped), escalate to headless Claude
+# for a no-tools root-cause diagnosis over evidence sysguard already gathered.
+# Diagnosis + fix are logged (ai_proposals.jsonl) and pushed to the phone; Claude
+# never touches the system. Expensive — hard rate-limited + skipped when tight.
+ai_diagnose_enabled: false           # opt-in; needs Claude Code CLI installed + authed
+claude_bin: /path/to/claude          # absolute path (systemd user PATH is minimal)
+ai_model: opus                       # headless Claude model (opus|sonnet|haiku or full id)
+ai_min_available_mb: 2048            # skip when the box is already low on memory
+ai_per_unit_cooldown_hours: 6        # one diagnosis per unit per window
+ai_max_per_day: 8                    # global daily cap (bounds cost)
+ai_timeout_seconds: 150
+# Self-tuning: auto-raise a unit's floor when Claude confirms a false positive
+# (bounded — never touches a running service, only quiets sysguard on that unit).
+ai_autotune_enabled: true
+ai_autotune_max_floor_frac: 0.8      # auto-floor <= this fraction of a container's cap
+ai_autotune_max_floor_mb: 8192       # ceiling for uncapped units
+
 # --- ollama (local LLM triage) ---
 ollama_url: http://localhost:11434
 primary_model: phi4-mini:3.8b        # fast triage every cycle
@@ -32,6 +50,14 @@ system_available_mb_floor: 2048      # below 2GB free -> triage everything > 1GB
 system_critical_available_mb: 1024   # below 1GB -> crisis mode (use fallback model)
 escalation_min_available_mb: 8192    # skip escalation model if less free than this
 
+# swap saturation — available_mb counts reclaimable cache, so a box can sit at
+# 99% swap (one spike from OOM) while every other signal reads healthy.
+swap_used_pct_warn: 85               # notify at this swap %
+swap_used_pct_crit: 95               # notify (OOM risk) at this swap %
+system_swap_pct_floor: 90            # triage units >1GB when swap >= this AND stalling
+system_swap_psi_full_min: 5.0        # PSI full-stall avg10 required alongside swap floor
+oom_forecast_warn_min: 30            # alert when forecast time-to-OOM drops below this (min)
+
 # --- adaptive baseline ---
 baseline_multiplier: 2.0             # flag when RSS exceeds N x the learned baseline (0 = disable)
 baseline_min_samples: 20             # samples before adaptive mode activates (~10 min)
@@ -41,6 +67,15 @@ max_actions_per_unit_per_hour: 1     # prevents flap loops
 require_confirm_for_kill: true
 allowed_actions: [restart, cap]      # 'kill' deliberately omitted
 default_cap_mb: 0                    # 0 = compute as 1.5x baseline RSS; or set absolute MB
+
+# --- action safety gate --- (flag/alert still happen; these gate EXECUTION only)
+skip_os_capped_units: true           # don't act on units the OS already memory-limits
+                                     # (systemd MemoryMax/High or docker --memory) — OS owns their OOM
+action_grace_samples: 20             # don't restart/cap a unit until it has this many samples
+                                     # (~10 min) unless system critical — protects new programs
+min_signals_to_act: 2                # auto-act only when >= this many thresholds fire…
+strong_signal_ratio: 2.0             # …OR one signal exceeds its threshold by this factor
+                                     # …OR system < critical floor. Lone marginal signal = alert-only.
 
 # --- skip list ---
 # Hardcoded skips (your shell, sshd, the desktop session, ollama, etc.) are always
