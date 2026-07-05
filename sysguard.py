@@ -521,42 +521,69 @@ def notify_ntfy(cfg: dict, title: str, body: str, priority: int = 3):
         logging.warning("ntfy notification failed: %s", e)
 
 
-_disk_alert_last: dict[str, float] = {}
-_DISK_ALERT_COOLDOWN = 900  # 15 min between repeated disk alerts for the same mount
+# Disk alerting is EDGE-triggered: notify once when a mount drops into warn/crit,
+# again only if it worsens (warn->crit) or a full day passes while still low, and
+# log — not push — a recovery. Hysteresis (must climb back above threshold*factor)
+# stops boundary flapping. The old level-triggered version re-pushed every 15 min
+# forever, spamming the phone for a static "disk a bit full" that needs cleanup, not
+# 96 notifications a day. Severity order: ok < warn < crit.
+_disk_state: dict[str, dict] = {}
+_DISK_REMIND_SEC = 86400          # at most one reminder/day while a mount stays low
+_DISK_RECOVER_FACTOR = 1.15       # must climb 15% above a threshold to clear it
 
 
 def check_disk(sysm: SystemSample, cfg: dict, now: float):
-    """Alert when disk is low. Today's crash was caused by a full root partition that
-    sysguard had no visibility into — this closes that blind spot."""
-    root_warn = cfg.get("disk_root_warn_mb", 20480)   # 20 GB
-    root_crit = cfg.get("disk_root_crit_mb", 10240)   # 10 GB
-    pool_warn = cfg.get("disk_pool_warn_mb", 30720)    # 30 GB
+    """Alert when disk is low. A full root partition once crashed the box with no
+    visibility — this closes that blind spot without spamming for a steady-state
+    'pool a bit full' condition."""
+    remind = cfg.get("disk_remind_sec", _DISK_REMIND_SEC)
+    rank = {"ok": 0, "warn": 1, "crit": 2}
 
-    def _alert(key: str, level: str, title: str, msg: str, priority: int = 4):
-        if now - _disk_alert_last.get(key, 0) < _DISK_ALERT_COOLDOWN:
+    def evaluate(mount: str, free_mb: float, warn_mb: float, crit_mb: float, label: str):
+        if free_mb <= 0:
             return
-        _disk_alert_last[key] = now
-        if level == "crit":
-            logging.error("DISK CRITICAL: %s", msg)
+        st = _disk_state.setdefault(mount, {"sev": "ok", "last_alert": 0.0})
+        prev = st["sev"]
+        if crit_mb and free_mb < crit_mb:
+            sev = "crit"
+        elif free_mb < warn_mb:
+            sev = "warn"
+        elif prev != "ok" and free_mb < warn_mb * _DISK_RECOVER_FACTOR:
+            sev = prev            # inside hysteresis band — hold, don't re-alert
         else:
-            logging.warning("disk low: %s", msg)
-        if cfg["kde_notify"]:
+            sev = "ok"
+        st["sev"] = sev
+        if sev == "ok":
+            if prev != "ok":
+                logging.info("disk recovered: %s %.1f GB free", label, free_mb / 1024)
+            return
+        worsened = rank[sev] > rank[prev]
+        stale = (now - st["last_alert"]) >= remind
+        if not (worsened or stale):
+            return                # same bad state, reminder not due — stay quiet
+        st["last_alert"] = now
+        crit = sev == "crit"
+        # For the docker pool, RECOMMEND a concrete one-tap reclaim (safe prunes)
+        # rather than just nagging. If a proposal was created/pending it sends its
+        # own richer notification, so suppress the bare alert.
+        if mount == "pool":
+            try:
+                if ai_diagnose.propose_disk_reclaim(mount, free_mb, cfg, notify_ntfy):
+                    logging.warning("disk %s: %s [reclaim proposed — approve on phone]", sev, label)
+                    return
+            except Exception as e:      # a proposal hiccup must never mute the alert
+                logging.warning("disk reclaim proposal failed: %s", e)
+        title = "sysguard: DISK CRITICAL" if crit else f"sysguard: {label} low"
+        msg = f"{label} {free_mb / 1024:.1f} GB free" + (" — disk-full crash imminent" if crit else "")
+        (logging.error if crit else logging.warning)("disk %s: %s", sev, msg)
+        if cfg.get("kde_notify"):
             notify_kde(title, msg)
-        notify_ntfy(cfg, title, msg, priority)
+        notify_ntfy(cfg, title, msg, 5 if crit else 3)
 
-    if 0 < sysm.disk_root_free_mb < root_crit:
-        _alert("root_crit", "crit", "sysguard: DISK CRITICAL",
-               f"root {sysm.disk_root_free_mb / 1024:.1f} GB free — disk-full crash imminent",
-               priority=5)
-    elif 0 < sysm.disk_root_free_mb < root_warn:
-        _alert("root_warn", "warn", "sysguard: disk low",
-               f"root {sysm.disk_root_free_mb / 1024:.1f} GB free",
-               priority=4)
-
-    if 0 < sysm.disk_pool_free_mb < pool_warn:
-        _alert("pool_warn", "warn", "sysguard: docker-pool low",
-               f"docker-pool {sysm.disk_pool_free_mb / 1024:.1f} GB free",
-               priority=3)
+    evaluate("root", sysm.disk_root_free_mb,
+             cfg.get("disk_root_warn_mb", 20480), cfg.get("disk_root_crit_mb", 10240), "root")
+    evaluate("pool", sysm.disk_pool_free_mb,
+             cfg.get("disk_pool_warn_mb", 30720), cfg.get("disk_pool_crit_mb", 10240), "docker-pool")
 
 
 _swap_alert_last: dict[str, float] = {}
@@ -1094,9 +1121,10 @@ def cycle(cfg: dict, units: dict[str, UnitHistory],
             merged[unit] = max(merged.get(unit, 0), mb)
         cfg["unit_rss_floor_mb"] = merged
     run_verifications(units, cfg, now)
-    # Execute any AI proposals the phone approved (via sysguard's own action
-    # machinery — never arbitrary shell). Cheap no-op when none are approved.
-    if cfg.get("ai_diagnose_enabled", False):
+    # Execute any proposals the phone approved (via sysguard's own action machinery
+    # — never arbitrary shell). Cheap no-op when none are approved. Runs when either
+    # the AI escalation OR deterministic disk-reclaim proposals can be produced.
+    if cfg.get("ai_diagnose_enabled", False) or cfg.get("disk_reclaim_enabled", True):
         ai_diagnose.execute_approved(cfg, execute_action, lift_cap, notify_ntfy)
 
     extra_units = cfg.get("extra_skip_units") or []

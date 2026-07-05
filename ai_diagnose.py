@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 import threading
 import time
@@ -39,7 +40,19 @@ _DEFAULT_CLAUDE_BIN = str(Path.home() / ".nvm/versions/node/v24.15.0/bin/claude"
 
 # Service-touching actions — human-gated: a one-tap phone approval executes them
 # via sysguard's existing guarded machinery (never arbitrary shell).
-APPROVE_ACTIONS = {"restart_unit", "lift_cap"}
+APPROVE_ACTIONS = {"restart_unit", "lift_cap", "reclaim_disk"}
+
+# Disk reclaim maps a plan KEY to a HARDCODED, safe docker command. A proposal may
+# only reference these keys — execution never runs an arbitrary string. Deliberately
+# EXCLUDES `volume prune`: external volumes (Romm/Nextcloud) look unused when their
+# container is stopped, and pruning them destroys data. build cache is regenerable;
+# `image prune` here is dangling-only (-f, not -a) so it can't remove a tagged
+# rollback image.
+_RECLAIM_OPS = {
+    "build_cache":     ["builder", "prune", "-af"],
+    "dangling_images": ["image", "prune", "-f"],
+}
+_DOCKER_BIN = "/usr/bin/docker"
 # Self-tuning actions — safe to AUTO-apply: they only make sysguard LESS
 # trigger-happy on a confirmed false positive (raise a unit's floor). Bounded so a
 # real leak toward the unit's cap still trips. Can't harm the box.
@@ -352,6 +365,108 @@ def _worker(unit_id: str, friendly: str, kind: str, evidence: str, cfg: dict, no
         logging.warning("ai_diagnose: notify failed: %s", e)
 
 
+def _parse_size_mb(s: str) -> float:
+    """Parse a docker size string like '44.87GB' / '512.3MB' / '0B' into MB."""
+    s = (s or "").strip()
+    m = re.match(r"([\d.]+)\s*([KMGT]?)i?B", s, re.IGNORECASE)
+    if not m:
+        return 0.0
+    val = float(m.group(1))
+    mult = {"": 1 / 1024 / 1024, "K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 * 1024}
+    return val * mult[m.group(2).upper()]
+
+
+def _docker_reclaimable_mb(cfg: dict) -> float:
+    """CONSERVATIVE MB the safe plan will free, from `docker system df`. Counts only
+    build-cache reclaimable — the reliable floor. Dangling-image cleanup in the plan
+    frees more on top, so this under-promises (we report the real total after). NOT
+    total unused images, which are mostly tagged rollback images the plan won't touch.
+    Read-only; 0.0 if docker is unreachable."""
+    try:
+        r = subprocess.run([_DOCKER_BIN, "system", "df", "--format", "{{.Type}}\t{{.Reclaimable}}"],
+                           capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return 0.0
+    total = 0.0
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2:
+            continue
+        typ, recl = parts[0].strip().lower(), parts[1].split("(")[0].strip()
+        if typ == "build cache":
+            total += _parse_size_mb(recl)
+    return total
+
+
+def propose_disk_reclaim(mount: str, free_mb: float, cfg: dict, notify_fn) -> bool:
+    """Instead of nagging that a disk is low, create a ONE-TAP reclaim proposal
+    (safe docker prunes) that the phone can approve. Returns True if a proposal was
+    created or one is already pending for this mount (so the caller suppresses the
+    bare alert). Deterministic — no LLM cost."""
+    if not cfg.get("disk_reclaim_enabled", True):
+        return False
+    # Don't stack proposals: if one is already pending for this mount, leave it.
+    for p in list_pending():
+        if p.get("structured_action") == "reclaim_disk" and p.get("unit_id") == f"disk:{mount}":
+            return True
+    reclaim_mb = _docker_reclaimable_mb(cfg)
+    if reclaim_mb < cfg.get("disk_reclaim_min_mb", 2048):
+        return False   # nothing worth proposing — let the plain alert fire
+    now = time.time()
+    est_gb = reclaim_mb / 1024
+    pid = f"{int(now)}-disk-{mount}"
+    root = f"{mount} low ({free_mb / 1024:.1f} GB free); >={est_gb:.0f} GB safely reclaimable from Docker."
+    fix = f"Prune Docker build cache (~{est_gb:.0f} GB) + dangling images. Safe/regenerable; leaves volumes untouched."
+    record = {
+        "id": pid, "ts": now, "unit_id": f"disk:{mount}", "friendly": f"{mount} disk",
+        "kind": "disk", "cost_usd": 0.0,
+        "diagnosis": {"root_cause": root, "recommended_fix": fix, "urgency": "medium"},
+        "structured_action": "reclaim_disk", "status": "pending",
+        "reclaim_plan": ["build_cache", "dangling_images"], "est_reclaim_mb": round(reclaim_mb),
+        "mount": mount, "free_mb": round(free_mb),
+    }
+    try:
+        with open(PROPOSALS_LOG, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError as e:
+        logging.warning("ai_diagnose: disk audit write failed: %s", e)
+    with _store_lock:
+        store = _load_store()
+        store[pid] = record
+        _save_store(store)
+    logging.warning("ai_diagnose[disk]: %s | fix: %s [pending — approve on phone]", root, fix)
+    try:
+        notify_fn(cfg, f"sysguard: {mount} disk low",
+                  f"{root}\n\nProposed: {fix}\n[approve on phone to free space]", 3)
+    except Exception as e:
+        logging.warning("ai_diagnose: disk notify failed: %s", e)
+    return True
+
+
+def _run_disk_reclaim(p: dict, cfg: dict) -> tuple[bool, str]:
+    """Execute an APPROVED reclaim proposal via the fixed safe op map. Never runs an
+    arbitrary command — unknown plan keys are skipped."""
+    msgs, ok_any = [], False
+    for op in (p.get("reclaim_plan") or []):
+        args = _RECLAIM_OPS.get(op)
+        if not args:
+            msgs.append(f"{op}: skipped (unknown op)")
+            continue
+        try:
+            r = subprocess.run([_DOCKER_BIN, *args], capture_output=True, text=True,
+                               timeout=300, stdin=subprocess.DEVNULL)
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+            msgs.append(f"{op}: error {e}")
+            continue
+        if r.returncode == 0:
+            ok_any = True
+            freed = next((l for l in r.stdout.splitlines() if "reclaimed" in l.lower()), "done")
+            msgs.append(f"{op}: {freed}")
+        else:
+            msgs.append(f"{op}: failed ({r.stderr.strip()[:80]})")
+    return ok_any, "; ".join(msgs) or "nothing to do"
+
+
 def execute_approved(cfg: dict, execute_action_fn, lift_cap_fn, notify_fn) -> None:
     """Run any proposals the phone APPROVED, via sysguard's existing action
     machinery (never arbitrary shell). Called once per monitor cycle. Each
@@ -374,6 +489,8 @@ def execute_approved(cfg: dict, execute_action_fn, lift_cap_fn, notify_fn) -> No
                 ok, msg = execute_action_fn(unit_id, friendly, kind, "restart", cfg, None)
             elif action == "lift_cap":
                 ok, msg = lift_cap_fn(unit_id, friendly, kind)
+            elif action == "reclaim_disk":
+                ok, msg = _run_disk_reclaim(p, cfg)
             else:
                 ok, msg = False, "unhandled action"
         except Exception as e:  # execution must never crash the cycle

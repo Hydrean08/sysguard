@@ -96,10 +96,15 @@ unit_action_overrides:
 unit_rss_floor_mb:
   # - my-fuse-daemon: 2500
 
-# --- disk monitoring (alerts at most once per 15 min per mount) ---
+# --- disk monitoring (edge-triggered: one alert on entering warn, again only on
+# worsening to crit or once/day while still low; recovery is logged, not pushed) ---
 disk_root_warn_mb: 20480
 disk_root_crit_mb: 10240
 disk_pool_warn_mb: 30720
+disk_pool_crit_mb: 10240
+disk_remind_sec: 86400
+disk_reclaim_enabled: true           # docker-pool low → propose a one-tap safe reclaim
+disk_reclaim_min_mb: 2048            # only propose if >= this much is safely reclaimable
 
 # --- phone notifications (ntfy) ---
 # Install the ntfy app, subscribe to your topic, done. Pick something unguessable.
