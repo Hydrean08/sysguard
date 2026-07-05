@@ -8,6 +8,7 @@ protects Claude, sshd, plasma, ollama, etc.
 """
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
@@ -590,41 +591,87 @@ def check_disk(sysm: SystemSample, cfg: dict, now: float):
              cfg.get("disk_pool_warn_mb", 30720), cfg.get("disk_pool_crit_mb", 10240), "docker-pool")
 
 
-_swap_alert_last: dict[str, float] = {}
-_SWAP_ALERT_COOLDOWN = 900  # 15 min between repeated swap alerts
+def top_swap_consumers(n: int = 3) -> list[tuple[str, float]]:
+    """Top-n processes by VmSwap, as (name, MB). Read-only, best-effort — this is
+    what turns a bare 'swap high' into an actionable 'ollama 1.9GB, python 1.7GB'."""
+    rows: list[tuple[float, str]] = []
+    for status in glob.glob("/proc/[0-9]*/status"):
+        try:
+            name = swap_kb = None
+            with open(status) as f:
+                for line in f:
+                    if line.startswith("Name:"):
+                        name = line.split(None, 1)[1].strip()
+                    elif line.startswith("VmSwap:"):
+                        swap_kb = int(line.split()[1])
+                        break
+            if name and swap_kb and swap_kb > 0:
+                rows.append((swap_kb / 1024.0, name))
+        except (OSError, ValueError, IndexError):
+            continue
+    rows.sort(reverse=True)
+    return [(name, mb) for mb, name in rows[:n]]
+
+
+# Swap alerting is EDGE-triggered (same as disk): alert once on entering warn, again
+# on worsening to crit or once/day while still high; recovery is logged, not pushed.
+# The old level-triggered version re-pushed every 15 min — the spam Chuck saw. Each
+# alert names the top swap consumers so it SUGGESTS what to act on (host processes
+# like ollama have no universally-safe one-tap fix, so naming the culprit is the win).
+_swap_state: dict = {"sev": "ok", "last_alert": 0.0}
+_SWAP_REMIND_SEC = 86400
+_SWAP_RECOVER_FACTOR = 0.92  # must drop to 92% of a threshold to clear it (hysteresis)
 
 
 def check_swap(sysm: SystemSample, cfg: dict, now: float):
-    """Alert on swap saturation — the blind spot in the available_mb-only checks.
-
-    available_mb counts reclaimable page cache, so the box can sit at 99% swap
-    (one spike from OOM) while every other signal reads healthy. This surfaces it.
-    Alert-only, like check_disk — never actuates.
-    """
+    """Alert on swap saturation — the blind spot in available_mb-only checks (which
+    count reclaimable cache, so the box can sit at 99% swap while everything else
+    reads healthy). Edge-triggered + names the top consumers. Alert-only."""
     total = sysm.swap_total_mb
     if total <= 0:
         return
     pct = 100.0 * sysm.swap_used_mb / total
     warn = cfg.get("swap_used_pct_warn", 85)
     crit = cfg.get("swap_used_pct_crit", 95)
+    remind = cfg.get("swap_remind_sec", _SWAP_REMIND_SEC)
+    rank = {"ok": 0, "warn": 1, "crit": 2}
 
-    def _alert(key: str, level: str, title: str, msg: str, priority: int):
-        if now - _swap_alert_last.get(key, 0) < _SWAP_ALERT_COOLDOWN:
-            return
-        _swap_alert_last[key] = now
-        (logging.error if level == "crit" else logging.warning)("%s", msg)
-        if cfg["kde_notify"]:
-            notify_kde(title, msg)
-        notify_ntfy(cfg, title, msg, priority)
+    prev = _swap_state["sev"]
+    if pct >= crit:
+        sev = "crit"
+    elif pct >= warn:
+        sev = "warn"
+    elif prev != "ok" and pct >= warn * _SWAP_RECOVER_FACTOR:
+        sev = prev            # hysteresis band — hold, don't re-alert or flap
+    else:
+        sev = "ok"
+    _swap_state["sev"] = sev
+    if sev == "ok":
+        if prev != "ok":
+            logging.info("swap recovered: %.0f%% (%.1fGB)", pct, sysm.swap_used_mb / 1024)
+        return
+    worsened = rank[sev] > rank[prev]
+    stale = (now - _swap_state["last_alert"]) >= remind
+    if not (worsened or stale):
+        return                # same bad state, reminder not due — stay quiet
+    _swap_state["last_alert"] = now
 
     used_gb, total_gb = sysm.swap_used_mb / 1024, total / 1024
-    if pct >= crit:
-        _alert("swap_crit", "crit", "sysguard: SWAP CRITICAL",
-               f"swap {pct:.0f}% full ({used_gb:.1f}/{total_gb:.1f}GB) — OOM risk "
-               f"(available RAM masks this)", priority=5)
-    elif pct >= warn:
-        _alert("swap_warn", "warn", "sysguard: swap high",
-               f"swap {pct:.0f}% full ({used_gb:.1f}/{total_gb:.1f}GB)", priority=4)
+    top = top_swap_consumers(3)
+    top_str = ", ".join(f"{name} {mb / 1024:.1f}GB" if mb >= 1024 else f"{name} {mb:.0f}MB"
+                        for name, mb in top) or "n/a"
+    crit_sev = sev == "crit"
+    title = "sysguard: SWAP CRITICAL" if crit_sev else "sysguard: swap high"
+    msg = (f"swap {pct:.0f}% full ({used_gb:.1f}/{total_gb:.1f}GB)"
+           + (" — OOM risk (available RAM masks this)" if crit_sev else "")
+           + f"\nbiggest: {top_str}")
+    (logging.error if crit_sev else logging.warning)("swap %s: %s", sev, msg.replace("\n", " "))
+    if cfg.get("kde_notify"):
+        notify_kde(title, msg)
+    notify_ntfy(cfg, title, msg, 5 if crit_sev else 4)
+    log_decision({"ts": now, "unit_id": "swap", "friendly": "swap", "kind": "swap",
+                  "trigger": f"{pct:.0f}% full", "action": f"alert:{sev}",
+                  "root_cause": f"top: {top_str}", "dry_run": cfg["dry_run"]})
 
 
 _headroom_hist: deque = deque(maxlen=20)  # (ts, headroom_mb) — memory + free swap
@@ -665,12 +712,18 @@ def check_oom_forecast(sysm: SystemSample, cfg: dict, now: float):
         return
     _oom_forecast_last = now
     priority = 5 if eta_min < 10 else 4
+    top = top_swap_consumers(3)
+    top_str = ", ".join(f"{name} {mb / 1024:.1f}GB" if mb >= 1024 else f"{name} {mb:.0f}MB"
+                        for name, mb in top) or "n/a"
     msg = (f"memory+swap headroom {ys[-1] / 1024:.1f}GB falling {-slope:.0f}MB/min "
-           f"→ OOM in ~{eta_min:.0f} min at this rate")
-    logging.error("OOM FORECAST: %s", msg)
+           f"→ OOM in ~{eta_min:.0f} min at this rate\nbiggest: {top_str}")
+    logging.error("OOM FORECAST: %s", msg.replace("\n", " "))
     if cfg["kde_notify"]:
         notify_kde("sysguard: OOM predicted", msg)
     notify_ntfy(cfg, "sysguard: OOM predicted", msg, priority=priority)
+    log_decision({"ts": now, "unit_id": "oom", "friendly": "OOM forecast", "kind": "swap",
+                  "trigger": f"OOM ~{eta_min:.0f}min", "action": "alert:forecast",
+                  "root_cause": f"top: {top_str}", "dry_run": cfg["dry_run"]})
 
 
 def gather_extra_context(friendly: str, kind: str) -> str:
