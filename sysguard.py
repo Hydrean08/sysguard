@@ -613,6 +613,78 @@ def top_swap_consumers(n: int = 3) -> list[tuple[str, float]]:
     return [(name, mb) for mb, name in rows[:n]]
 
 
+# Host processes SAFE to restart for swap relief (reload cleanly, no data loss).
+# Maps a /proc VmSwap 'Name' -> restartable (unit_id, friendly, kind). Games, the
+# desktop, and stateful apps are deliberately absent — never auto-propose those.
+_SWAP_SAFE_RESTART = {
+    "ollama": ("ollama", "ollama", "systemd"),
+}
+
+
+def _swap_restart_candidate(cfg: dict) -> tuple | None:
+    """Top swap consumer that's SAFELY restartable, as (unit_id, friendly, kind, mb).
+    Checks the known-safe host-service map + docker containers by cgroup swap. None
+    if nothing safe holds meaningful swap. This is the target the AI reasons about."""
+    min_mb = cfg.get("swap_relief_min_mb", 512)
+    best = None  # (mb, unit_id, friendly, kind)
+    for name, mb in top_swap_consumers(8):
+        tgt = _SWAP_SAFE_RESTART.get(name)
+        if not tgt or mb < min_mb:
+            continue
+        uid, fr, kind = tgt
+        try:
+            alive = subprocess.run(["systemctl", "is-active", uid], capture_output=True,
+                                   text=True, timeout=5).stdout.strip() in ("active", "activating")
+        except (subprocess.SubprocessError, OSError):
+            alive = False
+        if alive and (best is None or mb > best[0]):
+            best = (mb, uid, fr, kind)
+    # Docker containers holding swap (a leaking container whose cap drifted).
+    try:
+        ids = subprocess.run(["/usr/bin/docker", "ps", "-q"], capture_output=True,
+                             text=True, timeout=8).stdout.split()
+        for cid in ids:
+            try:
+                sw = int(open(f"/sys/fs/cgroup/system.slice/docker-{cid}.scope/memory.swap.current").read().strip())
+            except (OSError, ValueError):
+                continue
+            mb = sw / 1048576
+            if mb < min_mb or (best is not None and mb <= best[0]):
+                continue
+            nm = subprocess.run(["/usr/bin/docker", "inspect", "-f", "{{.Name}}", cid],
+                                capture_output=True, text=True, timeout=5).stdout.strip().lstrip("/")
+            if nm and not any(s in nm.lower() for s in HARDCODED_SKIPS):
+                best = (mb, f"docker:{nm}", f"docker:{nm}", "docker")
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return (best[1], best[2], best[3], best[0]) if best else None
+
+
+def _escalate_swap(sysm: SystemSample, pct: float, top_str: str, cfg: dict,
+                   reason: str = "swap saturation"):
+    """Hand a swap-relief decision to the AI: pick the top restartable consumer, give
+    the AI rich evidence, let it propose a phone-approved restart (e.g. ollama) or
+    advise. escalate() enforces its own enable/mem-floor/cooldown/daily-cap guards."""
+    cand = _swap_restart_candidate(cfg)
+    if not cand:
+        logging.info("swap escalate: no safe restartable consumer among top swap users")
+        return
+    uid, fr, kind, mb = cand
+    evidence = (
+        f"{reason}: swap {pct:.0f}% full "
+        f"({sysm.swap_used_mb / 1024:.1f}/{sysm.swap_total_mb / 1024:.1f}GB), "
+        f"available RAM {sysm.available_mb:.0f}MB.\n"
+        f"Top swap consumers: {top_str}.\n"
+        f"Candidate restart target: {fr} ({kind}) holds ~{mb / 1024:.1f}GB of swap; "
+        f"restarting frees that swap and it reloads on next use."
+    )
+    try:
+        ai_diagnose.escalate(uid, fr, kind, evidence, sysm.available_mb, cfg,
+                             notify_ntfy, context="swap")
+    except Exception as e:
+        logging.warning("swap escalate failed: %s", e)
+
+
 # Swap alerting is EDGE-triggered (same as disk): alert once on entering warn, again
 # on worsening to crit or once/day while still high; recovery is logged, not pushed.
 # The old level-triggered version re-pushed every 15 min — the spam Chuck saw. Each
@@ -672,6 +744,11 @@ def check_swap(sysm: SystemSample, cfg: dict, now: float):
     log_decision({"ts": now, "unit_id": "swap", "friendly": "swap", "kind": "swap",
                   "trigger": f"{pct:.0f}% full", "action": f"alert:{sev}",
                   "root_cause": f"top: {top_str}", "dry_run": cfg["dry_run"]})
+    # On CRITICAL swap, escalate the top restartable consumer to the AI, which
+    # investigates and proposes a phone-approved restart (e.g. ollama) — the "do
+    # something" path, not just an alert. Guarded/rate-limited inside escalate().
+    if crit_sev and cfg.get("ai_diagnose_enabled", False):
+        _escalate_swap(sysm, pct, top_str, cfg)
 
 
 _headroom_hist: deque = deque(maxlen=20)  # (ts, headroom_mb) — memory + free swap
@@ -724,6 +801,10 @@ def check_oom_forecast(sysm: SystemSample, cfg: dict, now: float):
     log_decision({"ts": now, "unit_id": "oom", "friendly": "OOM forecast", "kind": "swap",
                   "trigger": f"OOM ~{eta_min:.0f}min", "action": "alert:forecast",
                   "root_cause": f"top: {top_str}", "dry_run": cfg["dry_run"]})
+    # Predicted OOM → escalate for an AI-proposed relief action (not just a countdown).
+    if cfg.get("ai_diagnose_enabled", False):
+        pct = 100.0 * sysm.swap_used_mb / sysm.swap_total_mb if sysm.swap_total_mb else 0.0
+        _escalate_swap(sysm, pct, top_str, cfg, reason=f"predicted OOM in ~{eta_min:.0f}min")
 
 
 def gather_extra_context(friendly: str, kind: str) -> str:

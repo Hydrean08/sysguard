@@ -241,6 +241,26 @@ def _build_prompt(evidence: str) -> str:
     )
 
 
+def _build_swap_prompt(evidence: str) -> str:
+    return (
+        "You are a Linux memory/swap diagnostician for a Fedora 44 homelab (32GB RAM, "
+        "24GB swap). sysguard detected SWAP SATURATION / imminent OOM. The unit below "
+        "is the largest RESTARTABLE swap consumer; the evidence lists all top swap "
+        "consumers. Reason over ONLY the read-only evidence — do NOT run commands. "
+        "Decide whether restarting THIS unit is the right, safe way to relieve the "
+        "pressure (restarting frees the swap it holds and it reloads cleanly), or "
+        "whether a human/different action is needed. Output ONLY a JSON object with "
+        "keys: root_cause, confidence (high|medium|low), recommended_fix (specific, "
+        "e.g. 'restart ollama to reclaim ~1.8GB of idle model swap'), risk (what "
+        "restarting interrupts), urgency (low|medium|high), and structured_action — "
+        "\"restart_unit\" (restarting THIS unit safely relieves swap) or \"none\" "
+        "(unsafe to auto-restart, or a different consumer/human action is needed — "
+        "state it in recommended_fix). Choose restart_unit only when this unit is "
+        "genuinely holding reclaimable swap and restarts without data loss."
+        "\n\nEVIDENCE:\n" + evidence
+    )
+
+
 def _parse_result(raw: str) -> dict | None:
     """Extract the JSON diagnosis from Claude's result text (may be fenced)."""
     s = raw.strip()
@@ -291,13 +311,15 @@ def _run_claude(prompt: str, cfg: dict) -> tuple[dict | None, float]:
     return _parse_result(outer.get("result", "")), float(outer.get("total_cost_usd", 0.0) or 0.0)
 
 
-def _worker(unit_id: str, friendly: str, kind: str, evidence: str, cfg: dict, notify_fn) -> None:
+def _worker(unit_id: str, friendly: str, kind: str, evidence: str, cfg: dict, notify_fn,
+            context: str = "memory") -> None:
     now = time.time()
     evidence_full = evidence
     extra = _enrich_docker(friendly, cfg.get("claude_bin", _DEFAULT_CLAUDE_BIN))
     if extra:
         evidence_full += "\n" + extra
-    diag, cost = _run_claude(_build_prompt(evidence_full), cfg)
+    prompt = _build_swap_prompt(evidence_full) if context == "swap" else _build_prompt(evidence_full)
+    diag, cost = _run_claude(prompt, cfg)
     proposal_id = f"{int(now)}-{friendly[:24]}"
     action = str((diag or {}).get("structured_action", "none")).strip().lower()
     if action not in (APPROVE_ACTIONS | AUTO_ACTIONS):
@@ -566,7 +588,7 @@ def _finish(proposal_id: str, status: str, result_msg: str) -> None:
 
 
 def escalate(unit_id: str, friendly: str, kind: str, evidence: str,
-             available_mb: float, cfg: dict, notify_fn) -> None:
+             available_mb: float, cfg: dict, notify_fn, context: str = "memory") -> None:
     """Fire-and-forget AI root-cause escalation. Guarded by an enable switch, a
     system-memory floor, a per-unit cooldown, and a daily cap; runs detached so
     it never blocks the monitor loop."""
@@ -585,6 +607,6 @@ def escalate(unit_id: str, friendly: str, kind: str, evidence: str,
         return
     logging.warning("ai_diagnose: escalating %s to Claude for root-cause diagnosis", friendly)
     threading.Thread(
-        target=_worker, args=(unit_id, friendly, kind, evidence, cfg, notify_fn),
+        target=_worker, args=(unit_id, friendly, kind, evidence, cfg, notify_fn, context),
         daemon=True, name=f"ai-diagnose-{friendly[:20]}",
     ).start()
