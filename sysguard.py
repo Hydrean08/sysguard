@@ -579,6 +579,10 @@ def check_disk(sysm: SystemSample, cfg: dict, now: float):
         if cfg.get("kde_notify"):
             notify_kde(title, msg)
         notify_ntfy(cfg, title, msg, 5 if crit else 3)
+        # Also record it in the decisions feed so disk activity shows in the UI.
+        log_decision({"ts": now, "unit_id": f"disk:{mount}", "friendly": f"{label} disk",
+                      "kind": "disk", "trigger": f"{free_mb / 1024:.1f}GB free",
+                      "action": f"alert:{sev}", "root_cause": msg, "dry_run": cfg["dry_run"]})
 
     evaluate("root", sysm.disk_root_free_mb,
              cfg.get("disk_root_warn_mb", 20480), cfg.get("disk_root_crit_mb", 10240), "root")

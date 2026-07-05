@@ -31,6 +31,7 @@ from pathlib import Path
 STATE_DIR = Path.home() / ".local/share/sysguard"
 PROPOSALS_LOG = STATE_DIR / "ai_proposals.jsonl"     # immutable audit trail
 PROPOSALS_STORE = STATE_DIR / "ai_proposals.json"    # mutable {id: proposal} for approve/execute
+DECISIONS_LOG = STATE_DIR / "decisions.jsonl"        # the feed the web/phone UI renders
 AI_STATE_FILE = STATE_DIR / "ai_diagnose_state.json"
 # Machine-managed tuning overrides sysguard merges on top of config.yaml, so the
 # AI's self-corrections never touch (or strip comments from) the hand-tuned config.
@@ -398,6 +399,22 @@ def _docker_reclaimable_mb(cfg: dict) -> float:
     return total
 
 
+def _log_disk_decision(p: dict, action: str, trigger: str, cfg: dict) -> None:
+    """Append a disk event to the decisions feed so it shows in the web/phone UI —
+    disk activity used to be push-only and never appeared there. Best-effort."""
+    try:
+        with open(DECISIONS_LOG, "a") as f:
+            f.write(json.dumps({
+                "ts": time.time(), "unit_id": p.get("unit_id", "disk"),
+                "friendly": p.get("friendly", "disk"), "kind": "disk",
+                "trigger": str(trigger)[:120], "action": action,
+                "root_cause": (p.get("diagnosis") or {}).get("root_cause", ""),
+                "dry_run": cfg.get("dry_run", False),
+            }) + "\n")
+    except OSError as e:
+        logging.warning("ai_diagnose: disk decision log failed: %s", e)
+
+
 def propose_disk_reclaim(mount: str, free_mb: float, cfg: dict, notify_fn) -> bool:
     """Instead of nagging that a disk is low, create a ONE-TAP reclaim proposal
     (safe docker prunes) that the phone can approve. Returns True if a proposal was
@@ -434,6 +451,7 @@ def propose_disk_reclaim(mount: str, free_mb: float, cfg: dict, notify_fn) -> bo
         store = _load_store()
         store[pid] = record
         _save_store(store)
+    _log_disk_decision(record, "propose_reclaim", f"{free_mb / 1024:.1f}GB free", cfg)
     logging.warning("ai_diagnose[disk]: %s | fix: %s [pending — approve on phone]", root, fix)
     try:
         notify_fn(cfg, f"sysguard: {mount} disk low",
@@ -443,28 +461,51 @@ def propose_disk_reclaim(mount: str, free_mb: float, cfg: dict, notify_fn) -> bo
     return True
 
 
-def _run_disk_reclaim(p: dict, cfg: dict) -> tuple[bool, str]:
-    """Execute an APPROVED reclaim proposal via the fixed safe op map. Never runs an
-    arbitrary command — unknown plan keys are skipped."""
-    msgs, ok_any = [], False
+def _run_disk_reclaim(p: dict, cfg: dict) -> tuple[int, int, str]:
+    """Execute an APPROVED reclaim via the fixed safe op map. Returns
+    (freed_ops, failed_ops, msg). Never runs an arbitrary command. The timeout is
+    generous because `docker builder prune` on a large cache is slow — and it runs
+    server-side, so a short client timeout reports a FALSE failure while the daemon
+    finishes anyway (the bug that made a working prune look 'timed out')."""
+    timeout = int(cfg.get("disk_reclaim_timeout_sec", 1200))
+    msgs, freed, failed = [], 0, 0
     for op in (p.get("reclaim_plan") or []):
         args = _RECLAIM_OPS.get(op)
         if not args:
-            msgs.append(f"{op}: skipped (unknown op)")
+            msgs.append(f"{op}: skipped (unknown)")
             continue
         try:
             r = subprocess.run([_DOCKER_BIN, *args], capture_output=True, text=True,
-                               timeout=300, stdin=subprocess.DEVNULL)
+                               timeout=timeout, stdin=subprocess.DEVNULL)
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
-            msgs.append(f"{op}: error {e}")
+            failed += 1
+            msgs.append(f"{op}: error {type(e).__name__}")
             continue
         if r.returncode == 0:
-            ok_any = True
-            freed = next((l for l in r.stdout.splitlines() if "reclaimed" in l.lower()), "done")
-            msgs.append(f"{op}: {freed}")
+            freed += 1
+            line = next((l for l in r.stdout.splitlines() if "reclaimed" in l.lower()), "done")
+            msgs.append(f"{op}: {line}")
         else:
+            failed += 1
             msgs.append(f"{op}: failed ({r.stderr.strip()[:80]})")
-    return ok_any, "; ".join(msgs) or "nothing to do"
+    return freed, failed, "; ".join(msgs) or "nothing to do"
+
+
+def _reclaim_worker(pid: str, p: dict, cfg: dict, notify_fn) -> None:
+    """Run the reclaim DETACHED so a multi-minute prune never blocks the monitor
+    loop. Reports honestly: executed (all ops freed), partial (some failed), or
+    failed (nothing freed)."""
+    freed, failed, msg = _run_disk_reclaim(p, cfg)
+    status = "executed" if freed and not failed else ("partial" if freed else "failed")
+    _finish(pid, status, msg)
+    _log_disk_decision(p, f"reclaimed:{status}", msg, cfg)
+    logging.warning("ai_diagnose: reclaim_disk %s -> %s: %s", p.get("friendly"), status, msg)
+    try:
+        mark = {"executed": "✓", "partial": "⚠", "failed": "✗"}[status]
+        notify_fn(cfg, f"sysguard: {p.get('friendly')} reclaim", f"{mark} {msg[:250]}",
+                  4 if freed else 5)
+    except Exception:
+        pass
 
 
 def execute_approved(cfg: dict, execute_action_fn, lift_cap_fn, notify_fn) -> None:
@@ -483,14 +524,21 @@ def execute_approved(cfg: dict, execute_action_fn, lift_cap_fn, notify_fn) -> No
         if action not in APPROVE_ACTIONS:
             _finish(pid, "failed", f"action {action} not executable")
             continue
+        # Disk reclaim can run for minutes (a big `builder prune`) — run it DETACHED
+        # so it never blocks the monitor loop. Flip to "executing" first so the next
+        # cycle won't pick it up again; the worker flips to executed/partial/failed.
+        if action == "reclaim_disk":
+            _finish(pid, "executing", "reclaim running (may take a few minutes)")
+            logging.warning("ai_diagnose: reclaim_disk %s started (detached)", friendly)
+            threading.Thread(target=_reclaim_worker, args=(pid, p, cfg, notify_fn),
+                             daemon=True).start()
+            continue
         logging.warning("ai_diagnose: executing approved %s on %s (%s)", action, friendly, pid)
         try:
             if action == "restart_unit":
                 ok, msg = execute_action_fn(unit_id, friendly, kind, "restart", cfg, None)
             elif action == "lift_cap":
                 ok, msg = lift_cap_fn(unit_id, friendly, kind)
-            elif action == "reclaim_disk":
-                ok, msg = _run_disk_reclaim(p, cfg)
             else:
                 ok, msg = False, "unhandled action"
         except Exception as e:  # execution must never crash the cycle
