@@ -55,6 +55,7 @@ escalation_min_available_mb: 8192    # skip escalation model if less free than t
 swap_used_pct_warn: 85               # notify at this swap %
 swap_used_pct_crit: 95               # notify (OOM risk) at this swap %
 swap_remind_sec: 86400               # edge-triggered: re-remind at most once/day while high
+swap_relief_min_mb: 512               # AI escalates a restart of the top swap consumer holding >= this
 system_swap_pct_floor: 90            # triage units >1GB when swap >= this AND stalling
 system_swap_psi_full_min: 5.0        # PSI full-stall avg10 required alongside swap floor
 oom_forecast_warn_min: 30            # alert when forecast time-to-OOM drops below this (min)
