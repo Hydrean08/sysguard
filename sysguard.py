@@ -434,6 +434,30 @@ def call_ollama(url: str, model: str, prompt: str, timeout: int, num_thread: int
         return None
 
 
+def call_claude_triage(model: str, prompt: str, cfg: dict) -> Optional[dict]:
+    """Run one triage decision through the Claude CLI (Max subscription, no API key)
+    instead of a local Ollama model — so triage uses ZERO local RAM/GPU. Returns the
+    parsed {action, reason, root_cause} dict, or None on any failure (network down,
+    timeout, unparseable) so the caller can fall back to the tiny local model."""
+    claude_bin = cfg.get("claude_bin", ai_diagnose._DEFAULT_CLAUDE_BIN)
+    try:
+        r = subprocess.run(
+            [claude_bin, "-p", prompt, "--model", model, "--output-format", "json"],
+            capture_output=True, text=True, timeout=cfg.get("claude_triage_timeout_seconds", 45),
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        logging.warning("claude triage failed model=%s err=%s", model, e)
+        return None
+    if r.returncode != 0:
+        logging.warning("claude triage exit %s model=%s", r.returncode, model)
+        return None
+    try:
+        outer = json.loads(r.stdout)
+    except ValueError:
+        return None
+    return ai_diagnose._parse_result(outer.get("result", ""))
+
+
 def build_prompt(friendly: str, kind: str, hist: UnitHistory, sysm: SystemSample,
                  journal_tail: str, extra_context: str = "") -> str:
     samples = list(hist.samples)
@@ -1076,13 +1100,6 @@ def load_state() -> dict[str, UnitHistory]:
     return out
 
 
-def pick_model(cfg: dict, sysm: SystemSample) -> str:
-    """Drop to fallback when memory is critical so we don't make the crisis worse."""
-    if sysm.available_mb < cfg["system_critical_available_mb"]:
-        return cfg["fallback_model"]
-    return cfg["primary_model"]
-
-
 def should_flag(hist: UnitHistory, sysm: SystemSample, cfg: dict) -> Optional[str]:
     """Return a reason string if the unit should be triaged, else None.
 
@@ -1318,37 +1335,29 @@ def cycle(cfg: dict, units: dict[str, UnitHistory],
             logging.info("  rate-limited, skipping triage for %s", friendly)
             continue
 
-        model = pick_model(cfg, sysm)
         extra_ctx = gather_extra_context(friendly, kind)
         jtail = journal_tail(unit_id, friendly, kind)
         prompt = build_prompt(friendly, kind, hist, sysm, jtail, extra_ctx)
-        result = call_ollama(cfg["ollama_url"], model, prompt, cfg["ollama_timeout_seconds"],
-                             cfg.get("ollama_num_threads", 4))
+        # Triage on the Claude CLI (Sonnet) — zero local RAM/GPU, unlike the old
+        # phi4/glm4 Ollama models that loaded GBs to diagnose a memory problem.
+        # Falls back to the tiny local model (qwen3:1.7b, ~1GB) ONLY if Claude is
+        # unreachable, so a network blip can't blind triage. A novel pattern
+        # ("investigate") goes straight to the Opus escalation downstream — the
+        # old local glm4 middle tier (~5.3GB load) is gone.
+        result = call_claude_triage(cfg.get("triage_model", "sonnet"), prompt, cfg)
+        used_fallback = False
         if not result:
+            result = call_ollama(cfg["ollama_url"], cfg["fallback_model"], prompt,
+                                 cfg["ollama_timeout_seconds"], cfg.get("ollama_num_threads", 4))
+            used_fallback = bool(result)
+        if not result:
+            logging.warning("  triage unavailable for %s (Claude + local both failed)", friendly)
             continue
         action = result.get("action", "ignore")
         ai_reason = result.get("reason", "")
+        if used_fallback:
+            ai_reason = f"[offline fallback {cfg['fallback_model']}] {ai_reason}"
         root_cause = result.get("root_cause", "")
-
-        if action == "investigate":
-            esc_min = cfg.get("escalation_min_available_mb", 8192)
-            if sysm.available_mb >= esc_min:
-                esc = call_ollama(cfg["ollama_url"], cfg["escalation_model"],
-                                  prompt, cfg["ollama_timeout_seconds"],
-                                  cfg.get("ollama_num_threads", 4))
-                if esc:
-                    action = esc.get("action", "investigate")
-                    ai_reason = f"[escalated to {cfg['escalation_model']}] {esc.get('reason', '')}"
-                    root_cause = esc.get("root_cause", root_cause)
-            else:
-                logging.info(
-                    "  skipping escalation for %s: only %.0fMB free (need %dMB)",
-                    friendly, sysm.available_mb, esc_min,
-                )
-                # Don't set ignore yet — let the override check below apply first.
-                # A unit with a known fix should act even when escalation is skipped.
-                action = "investigate"
-                ai_reason = f"[escalation skipped: low mem] {ai_reason}"
 
         # Per-unit override: for units with a known-correct fix, force it over the
         # model's pick. Also fires when escalation was skipped (investigate) so that
@@ -1493,17 +1502,11 @@ def main():
 
     logging.info("sysguard starting (dry_run=%s, interval=%ds)",
                  cfg["dry_run"], cfg["sample_interval_seconds"])
-    logging.info("primary=%s escalation=%s fallback=%s",
-                 cfg["primary_model"], cfg["escalation_model"], cfg["fallback_model"])
-
-    # Pre-warm the primary model so the first real flag doesn't hit cold-start
-    # (cold load can be 30-45s; subsequent calls are sub-second).
-    logging.info("pre-warming %s ...", cfg["primary_model"])
-    warm = call_ollama(cfg["ollama_url"], cfg["primary_model"],
-                       '{"action":"ignore","reason":"warmup"}',
-                       cfg["ollama_timeout_seconds"],
-                       cfg.get("ollama_num_threads", 4))
-    logging.info("pre-warm result: %s", "ok" if warm else "FAILED — first triage may time out")
+    logging.info("triage=%s (Claude CLI) escalate=%s offline-fallback=%s",
+                 cfg.get("triage_model", "sonnet"), cfg.get("ai_model", "opus"),
+                 cfg["fallback_model"])
+    # No model pre-warm: triage runs on the Claude CLI (no local model to keep hot),
+    # and the qwen3 offline fallback is tiny and only loads if Claude is unreachable.
 
     units = load_state()
     logging.info("loaded %d unit histories from state", len(units))
