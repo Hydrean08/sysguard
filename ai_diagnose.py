@@ -167,6 +167,37 @@ def _save_state(state: dict) -> None:
         logging.warning("ai_diagnose: state save failed: %s", e)
 
 
+# A cheap phone page must NEVER be gated by the expensive AI diagnosis. When the
+# LLM path is suppressed (cooldown/cap/low-mem floor) but the box is genuinely in
+# trouble, sysguard still pages — on its own short cooldown so a sustained fire
+# keeps pinging instead of going dark for the full AI cooldown. This is the exact
+# gap that let a Nextcloud storm run silently for hours (2026-07-07): the 6h
+# per-unit AI cooldown suppressed the page, and when avail fell below the floor
+# escalate() returned without notifying at all.
+_FALLBACK_PAGE_COOLDOWN = 900  # 15 min between fallback pages for the same unit
+
+
+def _fallback_page(friendly: str, evidence: str, available_mb: float, why: str,
+                   cfg: dict, notify_fn, now: float) -> None:
+    """Send a lightweight page (no AI diagnosis) when escalation was suppressed but
+    the box is in real trouble. Own 15-min per-unit cooldown, separate from the AI
+    cooldown, so a worsening incident is never silenced by diagnosis rate limits."""
+    with _lock:
+        state = _load_state()
+        last = (state.get("last_page_by_unit") or {}).get(friendly, 0)
+        if now - last < _FALLBACK_PAGE_COOLDOWN:
+            return
+        state.setdefault("last_page_by_unit", {})[friendly] = now
+        _save_state(state)
+    headline = evidence.strip().split("\n", 1)[0][:160]
+    body = (f"{headline}\n(AI diagnosis {why}; paging anyway — box in trouble, "
+            f"avail {available_mb:.0f}MB)")
+    try:
+        notify_fn(cfg, f"sysguard: {friendly} — needs eyes", body, 5)
+    except Exception as e:  # noqa: BLE001 — a page must never crash the monitor
+        logging.warning("ai_diagnose: fallback page failed: %s", e)
+
+
 def _rate_ok(friendly: str, cfg: dict, now: float) -> tuple[bool, str]:
     """Enforce per-unit cooldown + global daily cap. Returns (ok, reason_if_not)."""
     cooldown_h = cfg.get("ai_per_unit_cooldown_hours", 6)
@@ -368,7 +399,17 @@ def _worker(unit_id: str, friendly: str, kind: str, evidence: str, cfg: dict, no
         _save_store(store)
 
     if not diag:
+        # The LLM was reached but produced nothing usable — usually a timeout
+        # because the box is too saturated to answer (the 2026-07-07 incident).
+        # That's the worst moment to stay silent: page with the raw evidence we
+        # already have, so a stuck diagnosis never means the human hears nothing.
         logging.warning("ai_diagnose: no usable diagnosis for %s (cost $%.3f)", friendly, cost)
+        headline = evidence.strip().split("\n", 1)[0][:160]
+        try:
+            notify_fn(cfg, f"sysguard: {friendly} — needs eyes",
+                      f"{headline}\n(AI diagnosis failed/timed out — paging with raw signal)", 5)
+        except Exception as e:  # noqa: BLE001 — a page must never crash the worker
+            logging.warning("ai_diagnose: fallback notify failed: %s", e)
         return
     root = str(diag.get("root_cause", ""))[:280]
     fix = str(diag.get("recommended_fix", ""))[:280]
@@ -594,16 +635,28 @@ def escalate(unit_id: str, friendly: str, kind: str, evidence: str,
     it never blocks the monitor loop."""
     if not cfg.get("ai_diagnose_enabled", False):
         return
+    now = time.time()
+    # "Box in real trouble" — the threshold below which a suppressed AI diagnosis
+    # must still produce a page. 2x the AI floor: covers the low-mem-floor skip and
+    # a cooldown/cap skip that lands while memory is genuinely tight (the incident
+    # had ~3GB free when the 6h cooldown silenced it).
     floor = cfg.get("ai_min_available_mb", 2048)
+    page_below = cfg.get("ai_fallback_page_below_mb", floor * 2)
     if available_mb < floor:
         # Don't add a ~400MB Claude process while the box is already tight — that's
         # when the fast local path + the human should handle it, not a heavy LLM.
+        # But DO page: this is precisely when the human needs to know.
         logging.info("ai_diagnose: skipping %s — only %.0fMB free (need %d)",
                      friendly, available_mb, floor)
+        _fallback_page(friendly, evidence, available_mb, "skipped: low mem", cfg, notify_fn, now)
         return
-    ok, why = _rate_ok(friendly, cfg, time.time())
+    ok, why = _rate_ok(friendly, cfg, now)
     if not ok:
         logging.info("ai_diagnose: skipping %s — %s", friendly, why)
+        # A repeat while the box is fine stays quiet; a repeat while memory is
+        # tight means the earlier fix didn't hold — page so it can't run silent.
+        if available_mb < page_below:
+            _fallback_page(friendly, evidence, available_mb, why, cfg, notify_fn, now)
         return
     logging.warning("ai_diagnose: escalating %s to Claude for root-cause diagnosis", friendly)
     threading.Thread(
