@@ -591,26 +591,45 @@ def check_disk(sysm: SystemSample, cfg: dict, now: float):
              cfg.get("disk_pool_warn_mb", 30720), cfg.get("disk_pool_crit_mb", 10240), "docker-pool")
 
 
-def top_swap_consumers(n: int = 3) -> list[tuple[str, float]]:
-    """Top-n processes by VmSwap, as (name, MB). Read-only, best-effort — this is
-    what turns a bare 'swap high' into an actionable 'ollama 1.9GB, python 1.7GB'."""
+def _top_proc_consumers(field: str, n: int) -> list[tuple[str, float]]:
+    """Top-n processes by a /proc status field (VmSwap: / VmRSS:), as (name, MB)."""
+    prefix = field + ":"
     rows: list[tuple[float, str]] = []
     for status in glob.glob("/proc/[0-9]*/status"):
         try:
-            name = swap_kb = None
+            name = kb = None
             with open(status) as f:
                 for line in f:
                     if line.startswith("Name:"):
                         name = line.split(None, 1)[1].strip()
-                    elif line.startswith("VmSwap:"):
-                        swap_kb = int(line.split()[1])
+                    elif line.startswith(prefix):
+                        kb = int(line.split()[1])
                         break
-            if name and swap_kb and swap_kb > 0:
-                rows.append((swap_kb / 1024.0, name))
+            if name and kb and kb > 0:
+                rows.append((kb / 1024.0, name))
         except (OSError, ValueError, IndexError):
             continue
     rows.sort(reverse=True)
     return [(name, mb) for mb, name in rows[:n]]
+
+
+def top_swap_consumers(n: int = 3) -> list[tuple[str, float]]:
+    """Top-n processes by VmSwap, as (name, MB). Read-only, best-effort — this is
+    what turns a bare 'swap high' into an actionable 'ollama 1.9GB, python 1.7GB'."""
+    return _top_proc_consumers("VmSwap", n)
+
+
+def top_ram_consumers(n: int = 3) -> list[tuple[str, float]]:
+    """Top-n processes by VmRSS. Alerts must show BOTH swap and RAM hogs: verified
+    2026-07-07 that the real grower (chatterbox python, 5.5GB RSS, 0 swap) was
+    invisible in a swap-only 'biggest:' list while swap sat at 97% from a long
+    tail of small processes — the alert named the wrong culprits."""
+    return _top_proc_consumers("VmRSS", n)
+
+
+def _fmt_consumers(rows: list[tuple[str, float]]) -> str:
+    return ", ".join(f"{name} {mb / 1024:.1f}GB" if mb >= 1024 else f"{name} {mb:.0f}MB"
+                     for name, mb in rows) or "n/a"
 
 
 # Host processes SAFE to restart for swap relief (reload cleanly, no data loss).
@@ -670,11 +689,16 @@ def _escalate_swap(sysm: SystemSample, pct: float, top_str: str, cfg: dict,
         logging.info("swap escalate: no safe restartable consumer among top swap users")
         return
     uid, fr, kind, mb = cand
+    # RAM hogs matter as much as swap hogs here: when swap fills from a long
+    # tail, the actionable target is usually the biggest RSS grower (verified
+    # 2026-07-07: chatterbox 5.5GB RSS / 0 swap was the real problem).
+    ram_str = _fmt_consumers(top_ram_consumers(3))
     evidence = (
         f"{reason}: swap {pct:.0f}% full "
         f"({sysm.swap_used_mb / 1024:.1f}/{sysm.swap_total_mb / 1024:.1f}GB), "
         f"available RAM {sysm.available_mb:.0f}MB.\n"
         f"Top swap consumers: {top_str}.\n"
+        f"Top RAM consumers: {ram_str}.\n"
         f"Candidate restart target: {fr} ({kind}) holds ~{mb / 1024:.1f}GB of swap; "
         f"restarting frees that swap and it reloads on next use."
     )
@@ -729,14 +753,13 @@ def check_swap(sysm: SystemSample, cfg: dict, now: float):
     _swap_state["last_alert"] = now
 
     used_gb, total_gb = sysm.swap_used_mb / 1024, total / 1024
-    top = top_swap_consumers(3)
-    top_str = ", ".join(f"{name} {mb / 1024:.1f}GB" if mb >= 1024 else f"{name} {mb:.0f}MB"
-                        for name, mb in top) or "n/a"
+    top_str = _fmt_consumers(top_swap_consumers(3))
+    ram_str = _fmt_consumers(top_ram_consumers(3))
     crit_sev = sev == "crit"
     title = "sysguard: SWAP CRITICAL" if crit_sev else "sysguard: swap high"
     msg = (f"swap {pct:.0f}% full ({used_gb:.1f}/{total_gb:.1f}GB)"
            + (" — OOM risk (available RAM masks this)" if crit_sev else "")
-           + f"\nbiggest: {top_str}")
+           + f"\ntop swap: {top_str}\ntop RAM: {ram_str}")
     (logging.error if crit_sev else logging.warning)("swap %s: %s", sev, msg.replace("\n", " "))
     if cfg.get("kde_notify"):
         notify_kde(title, msg)
@@ -789,11 +812,11 @@ def check_oom_forecast(sysm: SystemSample, cfg: dict, now: float):
         return
     _oom_forecast_last = now
     priority = 5 if eta_min < 10 else 4
-    top = top_swap_consumers(3)
-    top_str = ", ".join(f"{name} {mb / 1024:.1f}GB" if mb >= 1024 else f"{name} {mb:.0f}MB"
-                        for name, mb in top) or "n/a"
+    top_str = _fmt_consumers(top_swap_consumers(3))
+    ram_str = _fmt_consumers(top_ram_consumers(3))
     msg = (f"memory+swap headroom {ys[-1] / 1024:.1f}GB falling {-slope:.0f}MB/min "
-           f"→ OOM in ~{eta_min:.0f} min at this rate\nbiggest: {top_str}")
+           f"→ OOM in ~{eta_min:.0f} min at this rate"
+           f"\ntop swap: {top_str}\ntop RAM: {ram_str}")
     logging.error("OOM FORECAST: %s", msg.replace("\n", " "))
     if cfg["kde_notify"]:
         notify_kde("sysguard: OOM predicted", msg)
