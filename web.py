@@ -269,6 +269,10 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(ai_diagnose.list_pending())
                 except Exception:
                     self._json([])
+            elif u.path == "/api/triage":
+                # Live break-glass snapshot: what's killing the box right now.
+                import triage
+                self._json(triage.snapshot())
             else:
                 self._send(404, "not found", "text/plain")
         except Exception as e:
@@ -302,6 +306,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, json.dumps({"error": "proposal not found"}), "application/json")
                 return
             self._json({"ok": True, "id": pid, "status": status})
+        elif u.path == "/api/control":
+            # Break-glass: run one whitelisted, reversible container action NOW
+            # (not via the daemon's next cycle — that's too slow when thrashing).
+            # triage.control validates the verb + target and audit-logs.
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                body = json.loads(self.rfile.read(length) or b"{}")
+                verb = str(body.get("verb", ""))
+                target = str(body.get("target", ""))
+            except (ValueError, OSError):
+                self._send(400, json.dumps({"error": "bad request"}), "application/json")
+                return
+            import triage
+            ok, msg = triage.control(verb, target)
+            self._send(200 if ok else 409,
+                       json.dumps({"ok": ok, "verb": verb, "target": target, "msg": msg}),
+                       "application/json")
         else:
             self._send(404, "not found", "text/plain")
 
@@ -354,6 +375,31 @@ th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;lett
 tbody tr{cursor:pointer}
 tbody tr:hover{background:var(--panel2)}
 td.num{text-align:right;font-variant-numeric:tabular-nums}
+.autolbl{font-size:12px;color:var(--mut);font-weight:400;display:flex;align-items:center;gap:4px}
+.tstats{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 14px}
+.tstat{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 12px;min-width:96px}
+.tstat .tk{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.4px}
+.tstat .tv{font-size:17px;font-variant-numeric:tabular-nums;margin-top:2px}
+.tstat.hot .tv{color:var(--crit)} .tstat.warn .tv{color:var(--warn)}
+.thead{font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px;margin:12px 0 7px;border-bottom:1px solid var(--line);padding-bottom:4px}
+.tgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:8px}
+.crow{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+.crow.paused{border-color:var(--investigate)}
+.cname{font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cmeta{font-size:11px;color:var(--mut);font-variant-numeric:tabular-nums;margin:2px 0 7px}
+.cmeta .pz{color:var(--investigate)}
+.tbtns{display:flex;gap:5px;flex-wrap:wrap}
+.tbtn{background:var(--panel);border:1px solid var(--line);color:var(--fg);border-radius:6px;
+padding:4px 9px;font-size:12px;cursor:pointer;font-family:inherit}
+.tbtn:hover{border-color:var(--accent)} .tbtn:active{transform:translateY(1px)}
+.tbtn.freeze{border-color:var(--investigate);color:var(--investigate)}
+.tbtn.thaw{border-color:var(--ok);color:var(--ok)}
+.tbtn.danger{border-color:var(--crit);color:var(--crit)}
+.tbtn:disabled{opacity:.4;cursor:default}
+.tprocs{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:5px;font-size:12px}
+.tproc{display:flex;justify-content:space-between;background:var(--panel2);border:1px solid var(--line);
+border-radius:6px;padding:5px 9px;font-variant-numeric:tabular-nums}
+.tproc .pm{color:var(--mut)}
 .bar{height:6px;border-radius:3px;background:var(--line);overflow:hidden;min-width:60px}
 .bar>i{display:block;height:100%;background:var(--accent)}
 .tag{font-size:11px;padding:1px 7px;border-radius:5px;font-weight:600}
@@ -388,6 +434,19 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
 </header>
 <div class="wrap">
   <div class="cards" id="cards"></div>
+
+  <div class="panel" id="triagePanel">
+    <h2>🚨 Live triage <span class="hint">— what's on the box right now · break-glass controls</span>
+      <span class="spacer"></span>
+      <label class="autolbl"><input type="checkbox" id="triageAuto" checked> auto</label>
+      <button class="tbtn" id="triageRefresh">refresh</button>
+    </h2>
+    <div id="triageStats" class="tstats"></div>
+    <div class="thead">Containers <span class="hint" id="triageCErr"></span></div>
+    <div id="triageContainers" class="tgrid"></div>
+    <div class="thead">Top processes (host)</div>
+    <div id="triageProcs" class="tprocs"></div>
+  </div>
 
   <div class="panel">
     <h2>System memory <div class="ranges" id="sysRanges"></div></h2>
@@ -588,9 +647,65 @@ const RANGES=[{h:1,l:'1h'},{h:6,l:'6h'},{h:24,l:'24h'},{h:72,l:'3d'},{h:168,l:'7
 ranges('#sysRanges',RANGES,sysHours,h=>{sysHours=h;loadSys();});
 ranges('#unitRanges',RANGES,unitHours,h=>{unitHours=h;if(curUnit)selectUnit(curUnit);});
 
-async function refresh(){await Promise.all([loadOverview(),loadSys(),loadFeed()]);}
+// ---- Live triage (break-glass) ----
+const TOKEN=new URLSearchParams(location.search).get('token')||'';
+// Inject the token header into every same-origin /api/ fetch. Without this the
+// page's own data calls 401 whenever a token is set (they carried no auth — only
+// the phone app sent the header), so the dashboard silently showed nothing.
+(function(){const _f=window.fetch;window.fetch=function(url,opts){
+  opts=opts||{};
+  if(TOKEN && typeof url==='string' && url.startsWith('/api/')){
+    opts.headers=Object.assign({'X-Sysguard-Token':TOKEN},opts.headers||{});
+  }
+  return _f(url,opts);};})();
+function thdr(){return TOKEN?{'X-Sysguard-Token':TOKEN}:{}; }
+function tMB(m){return m>=1024?(m/1024).toFixed(1)+'G':m+'M';}
+async function loadTriage(){
+  let d; try{ d=await (await fetch('/api/triage',{headers:thdr()})).json(); }
+  catch(e){ document.getElementById('triageCErr').textContent='(fetch failed)'; return; }
+  const m=d.mem||{}, psi=d.psi||{}, load=(d.load||[0])[0];
+  const stat=(k,v,cl)=>'<div class="tstat '+(cl||'')+'"><div class="tk">'+k+'</div><div class="tv">'+v+'</div></div>';
+  const loadCl=load>16?'hot':load>8?'warn':'', swCl=m.swap_used_pct>=90?'hot':m.swap_used_pct>=75?'warn':'',
+        avCl=m.mem_available_mb<2048?'hot':m.mem_available_mb<4096?'warn':'', psiCl=psi.some_avg10>10?'hot':psi.some_avg10>2?'warn':'';
+  document.getElementById('triageStats').innerHTML=
+    stat('load 1m',load.toFixed(2),loadCl)+stat('avail',tMB(m.mem_available_mb||0),avCl)+
+    stat('swap',(m.swap_used_pct||0)+'%',swCl)+stat('mem used',(m.mem_used_pct||0)+'%')+
+    stat('PSI some',(psi.some_avg10||0).toFixed(1),psiCl);
+  document.getElementById('triageCErr').textContent=d.containers_error?('— '+d.containers_error):'';
+  const verbs=d.verbs||{};
+  document.getElementById('triageContainers').innerHTML=(d.containers||[]).slice(0,24).map(c=>{
+    const btn=(v,lbl,cl)=>verbs[v]?'<button class="tbtn '+cl+'" onclick="ctl(\''+v+'\',\''+c.name+'\','+(verbs[v].destructive?'true':'false')+')">'+lbl+'</button>':'';
+    const acts=c.paused?btn('unpause','▶ thaw','thaw'):btn('pause','❄ freeze','freeze');
+    return '<div class="crow'+(c.paused?' paused':'')+'"><div class="cname">'+c.name+'</div>'+
+      '<div class="cmeta">'+tMB(c.mem_mb||0)+' · '+(c.paused?'<span class="pz">paused</span>':c.state)+'</div>'+
+      '<div class="tbtns">'+acts+btn('restart','⟳','danger')+btn('stop','■','danger')+'</div></div>';
+  }).join('')||'<div class="hint">no containers (docker unreachable)</div>';
+  document.getElementById('triageProcs').innerHTML=(d.top_ram||[]).map(p=>
+    '<div class="tproc"><span>'+p.name+'</span><span class="pm">'+tMB(p.mb)+'</span></div>').join('');
+}
+async function ctl(verb,target,destructive){
+  const label=(verb==='pause'?'FREEZE':verb.toUpperCase());
+  if(destructive && !confirm(label+' container "'+target+'"?\n\nThis is not reversible with one tap.')) return;
+  try{
+    const r=await fetch('/api/control',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},thdr()),
+      body:JSON.stringify({verb,target})});
+    const j=await r.json();
+    if(!j.ok) alert(verb+' '+target+' failed: '+(j.msg||r.status));
+  }catch(e){ alert('control failed: '+e); }
+  loadTriage();
+}
+document.getElementById('triageRefresh').onclick=loadTriage;
+
+async function refresh(){
+  const tasks=[loadOverview(),loadSys(),loadFeed()];
+  if(document.getElementById('triageAuto').checked) tasks.push(loadTriage());
+  await Promise.all(tasks);
+}
+loadTriage();
 refresh();
 setInterval(refresh,15000);
+// Triage refreshes faster than the history panels — it's the live view.
+setInterval(()=>{if(document.getElementById('triageAuto').checked)loadTriage();},5000);
 window.addEventListener('resize',()=>{loadSys();if(curUnit)selectUnit(curUnit);});
 </script>
 </body></html>"""
