@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import secrets
 import subprocess
 import threading
 import time
@@ -292,7 +293,7 @@ def _build_prompt(evidence: str) -> str:
         "as normal; restart_unit/lift_cap only when they genuinely "
         "and safely fix a real problem on THIS unit; otherwise \"none\". Include "
         "floor_mb (integer MB) only for raise_floor."
-        "\n\nEVIDENCE:\n" + evidence
+        + _SPOTLIGHT + _fence(evidence)
     )
 
 
@@ -312,7 +313,7 @@ def _build_swap_prompt(evidence: str) -> str:
         "(unsafe to auto-restart, or a different consumer/human action is needed — "
         "state it in recommended_fix). Choose restart_unit only when this unit is "
         "genuinely holding reclaimable swap and restarts without data loss."
-        "\n\nEVIDENCE:\n" + evidence
+        + _SPOTLIGHT + _fence(evidence)
     )
 
 
