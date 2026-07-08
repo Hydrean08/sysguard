@@ -74,21 +74,26 @@ def load_auto_floors() -> dict:
 
 
 def _apply_floor(friendly: str, floor_mb: int, cfg: dict) -> tuple[bool, str]:
-    """Raise a unit's RSS floor so a confirmed false positive stops flagging.
-    BOUNDED: never above `ai_autotune_max_floor_frac` of the unit's cgroup cap (so a
-    genuine leak toward the cap still trips), never below the current floor, and
-    capped by ai_autotune_max_floor_mb for non-capped units."""
+    """Set a unit's auto-tuned RSS floor to the model's requested value — BIDIRECTIONAL.
+    Raising quiets a confirmed false positive; LOWERING re-sharpens a floor the model
+    now judges too high (so sysguard doesn't stay permanently blinder after one bad call).
+    BOUNDED both ways: never above `ai_autotune_max_floor_frac` of the unit's cgroup cap
+    (a real leak toward the cap still trips) or `ai_autotune_max_floor_mb`; never below
+    `ai_autotune_min_floor_mb` (avoid a pathological near-zero over-sensitive floor). Any
+    human-set config floor is a separate, hard lower bound applied at merge time in cycle()
+    — auto-tuning can lower the AUTO floor but never the human one."""
     hard_max = int(cfg.get("ai_autotune_max_floor_mb", 8192))
     if friendly.startswith("docker:"):
         cap_mb = _container_cap_mb(friendly)
         if cap_mb > 0:
             hard_max = min(hard_max, int(cap_mb * cfg.get("ai_autotune_max_floor_frac", 0.8)))
+    hard_min = int(cfg.get("ai_autotune_min_floor_mb", 128))
     current = load_auto_floors().get(friendly, 0)
-    # Clamp to the hard ceiling, then only apply if it strictly RAISES the floor —
-    # a request at/below the current auto-floor (or above the cap) is a no-op.
-    new_floor = min(int(floor_mb), hard_max)
-    if new_floor <= current:
-        return False, f"requested {floor_mb}MB not above current floor {current}MB (ceiling {hard_max}MB)"
+    # Clamp to [hard_min, hard_max] and apply in EITHER direction. A no-op only if the
+    # clamped value equals the current floor.
+    new_floor = max(hard_min, min(int(floor_mb), hard_max))
+    if new_floor == current:
+        return False, f"requested {floor_mb}MB already at current floor {current}MB (bounds {hard_min}-{hard_max}MB)"
     with _tuning_lock:
         try:
             data = json.loads(AUTO_TUNING_FILE.read_text()) if AUTO_TUNING_FILE.exists() else {}
@@ -101,7 +106,8 @@ def _apply_floor(friendly: str, floor_mb: int, cfg: dict) -> tuple[bool, str]:
             tmp.replace(AUTO_TUNING_FILE)
         except OSError as e:
             return False, f"write failed: {e}"
-    return True, f"floor set to {new_floor}MB (capped at {hard_max}MB)"
+    direction = "raised" if new_floor > current else "lowered"
+    return True, f"floor {direction} to {new_floor}MB (bounds {hard_min}-{hard_max}MB)"
 
 
 def _container_cap_mb(friendly: str) -> float:
@@ -260,12 +266,15 @@ def _build_prompt(evidence: str) -> str:
         "command or action), risk (what could go wrong), urgency (low|medium|high), "
         "and structured_action — ONE of: \"restart_unit\" (restart this exact unit "
         "cleanly reclaims the memory), \"lift_cap\" (a prior memory cap is "
-        "starving it), \"raise_floor\" (this is a FALSE POSITIVE — the unit's "
-        "learned baseline/threshold is too low for its legitimate working set, so "
-        "sysguard should stop flagging it; also set floor_mb to a value above the "
-        "unit's normal peak but well below its cgroup cap), or \"none\" (needs a "
-        "human). Prefer raise_floor when you conclude it's a false positive and no "
-        "real remediation is needed; restart_unit/lift_cap only when they genuinely "
+        "starving it), \"raise_floor\" (set sysguard's alert floor for this unit — use "
+        "it to TUNE the floor in EITHER direction: RAISE it (with floor_mb above the "
+        "unit's normal peak, below its cgroup cap) when this is a FALSE POSITIVE whose "
+        "legitimate working set is larger than the learned baseline; or LOWER it (with a "
+        "smaller floor_mb) when the current floor is too high and is masking real growth "
+        "you'd want caught. Base floor_mb on the unit's actual normal peak from the "
+        "evidence), or \"none\" (needs a "
+        "human). Prefer raise_floor when the fix is purely re-tuning what sysguard treats "
+        "as normal; restart_unit/lift_cap only when they genuinely "
         "and safely fix a real problem on THIS unit; otherwise \"none\". Include "
         "floor_mb (integer MB) only for raise_floor."
         "\n\nEVIDENCE:\n" + evidence

@@ -488,7 +488,15 @@ Pick ONE action:
 - "cap"         — apply systemd MemoryHigh to bound future growth without restart
 - "investigate" — pattern is novel; escalate to a stronger model
 
-Output JSON: {{"action": "ignore|restart|cap|investigate", "reason": "one short sentence", "root_cause": "what is driving the growth — active workload, memory leak, or unknown"}}
+Also judge:
+- "confidence": how sure you are the action is correct — "high" (clear runaway/leak or clear
+  benign), "medium" (probable but not certain), or "low" (marginal/ambiguous — one weak signal).
+- "is_runaway": true only if this is an obvious runaway/leak (sustained growth, far over
+  normal), false for a routine or one-off reading.
+Be conservative: a destructive restart/cap only executes on high confidence unless the system
+is already critical, so do not claim high confidence on a single marginal reading.
+
+Output JSON: {{"action": "ignore|restart|cap|investigate", "confidence": "high|medium|low", "is_runaway": true|false, "reason": "one short sentence", "root_cause": "what is driving the growth — active workload, memory leak, or unknown"}}
 """
 
 
@@ -1210,53 +1218,24 @@ def has_memory_cap(unit_id: str, friendly: str, kind: str) -> bool:
     return False
 
 
-def count_signals(hist: UnitHistory, sysm: SystemSample, cfg: dict) -> tuple[int, float]:
-    """Return (number of independent thresholds tripped, peak severity ratio).
-
-    Used by the action gate to distinguish an obvious runaway (many signals, or one
-    signal far over its threshold) from a lone marginal reading. MUST mirror the
-    thresholds in should_flag() — kept parallel rather than merged to leave the
-    battle-tested should_flag() untouched.
-    """
-    cur = hist.current_mb()
-    slope = hist.slope_mb_per_min()
-    jump = hist.jump_mb()
-    ratios: list[float] = []
-
-    g = cfg["rss_growth_mb_per_min"]
-    if slope >= g and g > 0:
-        ratios.append(slope / g)
-    j = cfg["rss_jump_mb"]
-    if jump >= j and j > 0 and len(hist.samples) >= cfg.get("rss_jump_min_samples", 5):
-        ratios.append(jump / j)
-
-    baseline_mult = cfg.get("baseline_multiplier", 2.0)
-    baseline_ready = (baseline_mult > 0 and hist.baseline_rss_mb > 0
-                      and len(hist.samples) >= cfg.get("baseline_min_samples", 20))
-    if baseline_ready:
-        threshold = hist.baseline_rss_mb * baseline_mult
-        if cur >= threshold and slope > 5:
-            ratios.append(cur / threshold)
-    else:
-        if cur >= cfg["rss_absolute_mb"] and (slope > 5 or sysm.available_mb < cfg["system_available_mb_floor"]):
-            ratios.append(cur / cfg["rss_absolute_mb"])
-
-    if sysm.available_mb < cfg["system_available_mb_floor"] and cur >= 1024:
-        ratios.append(cfg["system_available_mb_floor"] / max(1.0, sysm.available_mb))
-
-    return len(ratios), (max(ratios) if ratios else 0.0)
-
-
 def gate_action(unit_id: str, friendly: str, kind: str, hist: UnitHistory,
-                sysm: SystemSample, cfg: dict, has_override: bool) -> Optional[str]:
+                sysm: SystemSample, cfg: dict, has_override: bool,
+                confidence: str = "medium", is_runaway: bool = False) -> Optional[str]:
     """Decide whether a destructive restart/cap should EXECUTE. Returns None to
     proceed, or a short reason string to HOLD (alert-only). Explicit
     unit_action_overrides bypass every gate (the user asked for that action).
 
-    The gates, in order: (1) the OS already caps this unit; (2) it's too new to
-    judge and the system isn't critical (protects freshly-added programs); (3) the
-    evidence is a single marginal signal (not an obvious runaway) and the system
-    isn't critical.
+    Two kinds of gate, kept deliberately separate:
+      * SAFETY floors (bets on blast-radius, valid at any model strength) — the OS
+        already caps this unit; it's too new to judge and the system isn't critical.
+        These stay hardcoded on purpose.
+      * The EXECUTE-vs-alert-only judgment — this used to be a hand-tuned threshold
+        vote (count_signals: mirror should_flag(), min_signals/strong_ratio). That was
+        a human heuristic deciding over the same evidence the triage model already saw.
+        It's now the MODEL's own confidence: a destructive action runs only on high
+        confidence (or a clear runaway), unless the system is already critical. Marginal
+        calls alert instead of acting — the model, not a threshold, draws that line, and
+        it gets sharper as the model does.
     """
     if has_override:
         return None
@@ -1269,10 +1248,8 @@ def gate_action(unit_id: str, friendly: str, kind: str, hist: UnitHistory,
     if len(hist.samples) < grace and not critical:
         return f"unit too new ({len(hist.samples)}/{grace} samples) — grace period, system not critical"
 
-    nsig, peak = count_signals(hist, sysm, cfg)
-    strong = peak >= cfg.get("strong_signal_ratio", 2.0)
-    if not (critical or strong or nsig >= cfg.get("min_signals_to_act", 2)):
-        return f"low confidence ({nsig} signal(s), peak {peak:.1f}×) — alert only"
+    if not (critical or is_runaway or confidence == "high"):
+        return f"model {confidence} confidence (runaway={is_runaway}) — alert only, not acting"
     return None
 
 
@@ -1358,6 +1335,10 @@ def cycle(cfg: dict, units: dict[str, UnitHistory],
         if used_fallback:
             ai_reason = f"[offline fallback {cfg['fallback_model']}] {ai_reason}"
         root_cause = result.get("root_cause", "")
+        # The MODEL's own read of how sure it is — this, not a hand-tuned threshold
+        # vote, gates whether a destructive action executes (see gate_action).
+        confidence = str(result.get("confidence", "medium")).strip().lower()
+        is_runaway = bool(result.get("is_runaway", False))
 
         # Per-unit override: for units with a known-correct fix, force it over the
         # model's pick. Also fires when escalation was skipped (investigate) so that
@@ -1396,7 +1377,8 @@ def cycle(cfg: dict, units: dict[str, UnitHistory],
         # is genuinely critical). Held actions are logged (visible on the dashboard)
         # but do NOT execute or notify — this is what stops sysguard from becoming
         # the thing that disrupts services on every marginal flag.
-        held = gate_action(unit_id, friendly, kind, hist, sysm, cfg, has_override) \
+        held = gate_action(unit_id, friendly, kind, hist, sysm, cfg, has_override,
+                           confidence, is_runaway) \
             if action in ("restart", "cap") else None
         if held:
             decision["held"] = True
