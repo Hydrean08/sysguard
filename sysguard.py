@@ -1362,7 +1362,9 @@ def cycle(cfg: dict, units: dict[str, UnitHistory],
 
         decision = {
             "ts": now, "unit_id": unit_id, "friendly": friendly, "kind": kind,
-            "trigger": reason, "model": model, "action": action,
+            "trigger": reason,
+            "model": (cfg["fallback_model"] if used_fallback else cfg.get("triage_model", "sonnet")),
+            "action": action,
             "overridden_from": overridden_from,
             "ai_reason": ai_reason, "root_cause": root_cause,
             "rss_mb": hist.current_mb(),
