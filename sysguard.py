@@ -623,10 +623,50 @@ def check_disk(sysm: SystemSample, cfg: dict, now: float):
              cfg.get("disk_pool_warn_mb", 30720), cfg.get("disk_pool_crit_mb", 10240), "docker-pool")
 
 
+# Interpreter/runtime comms that are USELESS as an alert label on their own —
+# a dozen services share each. Resolved to the real service by _proc_label.
+_GENERIC_COMMS = {
+    "python", "python3", "python3.11", "python3.12", "python3.13",
+    "node", "uvicorn", "gunicorn", "ruby", "java", "perl", "sh", "bash",
+}
+
+
+def _proc_label(pid: str, comm: str, docker_names: dict) -> str:
+    """Resolve a generic interpreter comm (python3, node, uvicorn, …) to the real
+    service: the container name if containerized, else the script basename — so an
+    alert reads 'repo-chatterbox-tts-server-1' / 'orionfs.py' instead of 'python3'.
+    Non-generic comms (clamd, ollama, …) are already meaningful and pass through."""
+    if comm not in _GENERIC_COMMS:
+        return comm
+    # Containerized → friendly container name (cgroup contains the docker scope).
+    try:
+        with open(f"/proc/{pid}/cgroup") as f:
+            cg = f.read()
+        for scope, fname in docker_names.items():
+            if scope in cg:
+                return fname
+    except OSError:
+        pass
+    # Host → the script filename (or `-m module`) from the command line.
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            args = [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+        for i, a in enumerate(args):
+            if i > 0 and os.path.basename(a).endswith((".py", ".js", ".mjs")):
+                return os.path.basename(a)
+            if a == "-m" and i + 1 < len(args):
+                return f"{comm}:{args[i + 1]}"
+    except OSError:
+        pass
+    return comm
+
+
 def _top_proc_consumers(field: str, n: int) -> list[tuple[str, float]]:
-    """Top-n processes by a /proc status field (VmSwap: / VmRSS:), as (name, MB)."""
+    """Top-n processes by a /proc status field (VmSwap: / VmRSS:), as (name, MB).
+    `name` is resolved from a bare interpreter comm to the real service (see
+    _proc_label) so the alert names something you can act on."""
     prefix = field + ":"
-    rows: list[tuple[float, str]] = []
+    rows: list[tuple[float, str, str]] = []  # (mb, pid, comm)
     for status in glob.glob("/proc/[0-9]*/status"):
         try:
             name = kb = None
@@ -638,11 +678,14 @@ def _top_proc_consumers(field: str, n: int) -> list[tuple[str, float]]:
                         kb = int(line.split()[1])
                         break
             if name and kb and kb > 0:
-                rows.append((kb / 1024.0, name))
+                rows.append((kb / 1024.0, status.split("/")[2], name))
         except (OSError, ValueError, IndexError):
             continue
-    rows.sort(reverse=True)
-    return [(name, mb) for mb, name in rows[:n]]
+    rows.sort(key=lambda r: r[0], reverse=True)
+    top = rows[:n]
+    # Only fetch the docker map (a subprocess) when a generic comm is in the top-n.
+    docker_names = docker_name_map() if any(c in _GENERIC_COMMS for _, _, c in top) else {}
+    return [(_proc_label(pid, comm, docker_names), mb) for mb, pid, comm in top]
 
 
 def top_swap_consumers(n: int = 3) -> list[tuple[str, float]]:
