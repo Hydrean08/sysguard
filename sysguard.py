@@ -628,6 +628,9 @@ def check_disk(sysm: SystemSample, cfg: dict, now: float):
 _GENERIC_COMMS = {
     "python", "python3", "python3.11", "python3.12", "python3.13",
     "node", "uvicorn", "gunicorn", "ruby", "java", "perl", "sh", "bash",
+    # A Python app that renamed its main thread leaks "MainThread" as the comm —
+    # just as useless a label as the interpreter name, so resolve it too.
+    "MainThread",
 }
 
 
