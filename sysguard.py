@@ -650,15 +650,27 @@ def _proc_label(pid: str, comm: str, docker_names: dict) -> str:
                 return fname
     except OSError:
         pass
-    # Host → the script filename (or `-m module`) from the command line.
+    # Host → the script/binary being run, from the command line: a .py/.js file,
+    # a `-m module`, or (fallback) the first positional arg's basename — which
+    # catches node_modules/.bin/<tool> wrappers like 'playwright' that have no ext.
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
             args = [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+        target = None
         for i, a in enumerate(args):
-            if i > 0 and os.path.basename(a).endswith((".py", ".js", ".mjs")):
-                return os.path.basename(a)
+            if i == 0:
+                continue
             if a == "-m" and i + 1 < len(args):
                 return f"{comm}:{args[i + 1]}"
+            if a.startswith("-"):
+                continue
+            base = os.path.basename(a)
+            if base.endswith((".py", ".js", ".mjs")):
+                return base
+            if target is None:
+                target = base
+        if target:
+            return target
     except OSError:
         pass
     return comm
